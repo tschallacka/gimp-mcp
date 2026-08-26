@@ -4,3 +4,11 @@ repos:
     hooks:
       - id: ruff-check
         args: [--fix]
+  - repo: local
+    hooks:
+      - id: capabilities-current
+        name: docs/CAPABILITIES.md matches the tools
+        entry: python3 tools/gen_capabilities.py --check
+        language: system
+        pass_filenames: false
+        files: ^(gimp_mcp_server\.py|gimp-mcp-plugin\.py|tools/gen_capabilities\.py)$

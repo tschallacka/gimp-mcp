@@ -200,9 +200,16 @@ if [ -n "$SOURCE_DIR" ]; then
     [ -f "$SOURCE_DIR/$PLUGIN_FILE" ] || die "$SOURCE_DIR/$PLUGIN_FILE not found"
     cp "$SOURCE_DIR/$PLUGIN_FILE" "$SRC"
     ok "using local $SOURCE_DIR/$PLUGIN_FILE"
-elif [ -f "$(dirname "$0")/$PLUGIN_FILE" ]; then
-    cp "$(dirname "$0")/$PLUGIN_FILE" "$SRC"
-    ok "using $(dirname "$0")/$PLUGIN_FILE"
+elif [ -n "${BASH_SOURCE[0]:-}" ] && [ -r "${BASH_SOURCE[0]}" ] \
+     && [ -f "$(dirname "${BASH_SOURCE[0]}")/$PLUGIN_FILE" ]; then
+    # Only when this script is a real file next to the plugin, i.e. run from a
+    # checkout. Piped from curl there is no script file: $0 is "bash" and
+    # BASH_SOURCE is unset, so `dirname "$0"` would resolve to the *current
+    # directory* and quietly install whatever gimp-mcp-plugin.py happened to be
+    # sitting there instead of the version just downloaded.
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    cp "$script_dir/$PLUGIN_FILE" "$SRC"
+    ok "using $script_dir/$PLUGIN_FILE"
 else
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL "$REPO_RAW/$PLUGIN_FILE" -o "$SRC" \

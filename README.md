@@ -815,6 +815,16 @@ To bump the pinned hook versions later:
 uv run pre-commit autoupdate
 ```
 
+## Full tool reference
+
+[docs/CAPABILITIES.md](docs/CAPABILITIES.md) documents all 90 tools — signature,
+purpose, parameters and return shape — grouped by what they are for. It is
+generated from the server source by `tools/gen_capabilities.py`, and a
+pre-commit hook fails if it drifts, so it cannot disagree with the code.
+
+Point an agent at that file if it needs the whole surface; the sections above
+cover the parts that change how you should work rather than what is available.
+
 ## License and copyright
 
 GNU General Public License v3.0 or later. The full text is in [LICENSE](LICENSE),
