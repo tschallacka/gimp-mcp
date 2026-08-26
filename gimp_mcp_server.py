@@ -7,8 +7,10 @@ import socket
 import json
 import logging
 import base64
+import os
 import traceback
 import time
+import uuid
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -16,6 +18,12 @@ logger = logging.getLogger("GimpMCPServer")
 
 GIMP_HOST = 'localhost'
 GIMP_PORT = 9877
+
+# One MCP server process is started per client session, so a value minted here
+# is exactly a per-session id. The plugin tags every image this session opens
+# with it, which is what keeps sessions from stepping on each other's images
+# in a shared GIMP.
+SESSION_ID = f"mcp-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 class GimpConnection:
     def __init__(self, host=GIMP_HOST, port=GIMP_PORT):
@@ -47,7 +55,9 @@ class GimpConnection:
     def send_command(self, command_type, params=None):
         if not self.sock:
             self.connect()
-        command = {"type": command_type, "params": params or {"args": []}}
+        params = dict(params) if params else {"args": []}
+        params.setdefault("_session", SESSION_ID)
+        command = {"type": command_type, "params": params}
         try:
             self.sock.sendall(json.dumps(command).encode('utf-8') + b'\n')
             response_data = b''
@@ -149,7 +159,9 @@ def new_canvas(
     - resolution: DPI resolution (default: 72)
 
     Returns:
+    - handle: stable identifier to pass as `image` to other tools
     - image_id: internal GIMP image ID
+    - label: the name you gave, also usable as a lookup key
     - width / height: confirmed dimensions
     - color_mode: confirmed mode
     - display_opened: whether a GIMP window was opened
@@ -310,7 +322,7 @@ def get_gimp_info(ctx: Context) -> dict:
 @mcp.tool()
 def get_state_snapshot(
     ctx: Context,
-    image_index: int = 0,
+    image: str | int | None = None,
     max_size: int = 512,
     region: dict | None = None,
     label: str = ""
@@ -321,7 +333,9 @@ def get_state_snapshot(
     letting them verify results and decide next steps without saving to disk.
 
     Parameters:
-    - image_index: Which open image to snapshot (default: 0 = most recent)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
     - max_size: Maximum width/height of the returned preview in pixels (default: 512)
     - region: Optional dict {x, y, width, height} to zoom into a specific area
               e.g. {"x": 200, "y": 300, "width": 100, "height": 80} for mouth area
@@ -342,7 +356,7 @@ def get_state_snapshot(
         if label:
             print(f"[snapshot] {label}")
         conn = get_gimp_connection()
-        params: dict = {"image_index": image_index}
+        params: dict = {"image": image}
         if max_size:
             params["max_width"]  = max_size
             params["max_height"] = max_size
@@ -518,14 +532,21 @@ def gimp_iterative_workflow() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def open_image(ctx: Context, file_path: str) -> dict:
+def open_image(ctx: Context, file_path: str, label: str | None = None) -> dict:
     """Open an image file in GIMP and create a display window.
+
+    The returned `handle` is the stable way to refer to this image afterwards;
+    the file path and its base name work too. Do not address images by
+    position -- the list reorders whenever an image opens or closes.
 
     Parameters:
     - file_path: Absolute path to the image file to open (PNG, JPEG, TIFF, etc.)
+    - label: Optional friendly name; defaults to the file's base name
 
     Returns:
+    - handle: stable identifier to pass as `image` to other tools
     - image_id: internal GIMP image ID
+    - label / file_path: what this image can also be looked up by
     - width / height: image dimensions in pixels
     - color_mode: RGB / Grayscale / Indexed
     - num_layers: number of layers in the image
@@ -533,7 +554,9 @@ def open_image(ctx: Context, file_path: str) -> dict:
     """
     try:
         conn = get_gimp_connection()
-        result = conn.send_command("open_image", {"file_path": file_path})
+        result = conn.send_command(
+            "open_image", {"file_path": file_path, "label": label}
+        )
         if result["status"] == "success":
             return result["results"]
         raise Exception(result.get("error", "Unknown error"))
@@ -543,12 +566,14 @@ def open_image(ctx: Context, file_path: str) -> dict:
 
 
 @mcp.tool()
-def save_xcf(ctx: Context, file_path: str, image_index: int = 0) -> dict:
+def save_xcf(ctx: Context, file_path: str, image: str | int | None = None) -> dict:
     """Save the current image as a GIMP XCF file (preserves all layers and metadata).
 
     Parameters:
     - file_path: Absolute path for the output .xcf file
-    - image_index: Index of the image to save (default 0 = first open image)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns:
     - status: "success" or "error"
@@ -556,7 +581,7 @@ def save_xcf(ctx: Context, file_path: str, image_index: int = 0) -> dict:
     """
     try:
         conn = get_gimp_connection()
-        result = conn.send_command("save_xcf", {"file_path": file_path, "image_index": image_index})
+        result = conn.send_command("save_xcf", {"file_path": file_path, "image": image})
         if result["status"] == "success":
             return result["results"]
         raise Exception(result.get("error", "Unknown error"))
@@ -572,7 +597,7 @@ def export_image(
     format: str = "png",
     quality: int = 90,
     flatten: bool = True,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Export the current image to a raster file (PNG, JPEG, WEBP, TIFF).
 
@@ -581,7 +606,9 @@ def export_image(
     - format: Output format — "png" (default), "jpeg", "webp", "tiff"
     - quality: JPEG/WEBP quality 1-100 (default 90; ignored for PNG/TIFF)
     - flatten: Flatten all layers before export (default True)
-    - image_index: Index of the image to export (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns:
     - status, file_path, format, file_size_bytes
@@ -593,7 +620,7 @@ def export_image(
             "format": format,
             "quality": quality,
             "flatten": flatten,
-            "image_index": image_index,
+            "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -610,7 +637,8 @@ def batch_export(
     format: str = "png",
     quality: int = 90,
     name_pattern: str = "{name}",
-    image_index: int | None = None
+    image: str | int | None = None,
+    mine_only: bool = False
 ) -> dict:
     """Export all open images (or a specific one) to a directory.
 
@@ -619,7 +647,9 @@ def batch_export(
     - format: "png", "jpeg", "webp", "tiff" (default "png")
     - quality: JPEG/WEBP quality (default 90)
     - name_pattern: Filename template — use {name} for image name, {index} for position
-    - image_index: If set, export only that image; omit to export all open images
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns:
     - exported: list of {file_path, name, width, height}
@@ -633,8 +663,10 @@ def batch_export(
             "quality": quality,
             "name_pattern": name_pattern,
         }
-        if image_index is not None:
-            params["image_index"] = image_index
+        if image is not None:
+            params["image"] = image
+        if mine_only:
+            params["mine_only"] = True
         conn = get_gimp_connection()
         result = conn.send_command("batch_export", params)
         if result["status"] == "success":
@@ -650,18 +682,20 @@ def batch_export(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def auto_levels(ctx: Context, image_index: int = 0, layer_name: str | None = None) -> dict:
+def auto_levels(ctx: Context, image: str | int | None = None, layer_name: str | None = None) -> dict:
     """Automatically stretch the tonal range of an image (auto levels / auto stretch contrast).
 
     Parameters:
-    - image_index: Index of the target image (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
     - layer_name: Name of the layer to adjust; defaults to active layer
 
     Returns status dict.
     """
     try:
         conn = get_gimp_connection()
-        result = conn.send_command("auto_levels", {"image_index": image_index, "layer_name": layer_name})
+        result = conn.send_command("auto_levels", {"image": image, "layer_name": layer_name})
         if result["status"] == "success":
             return result["results"]
         raise Exception(result.get("error", "Unknown error"))
@@ -676,7 +710,7 @@ def adjust_curves(
     preset: str = "s_curve",
     points: list | None = None,
     channel: str = "value",
-    image_index: int = 0,
+    image: str | int | None = None,
     layer_name: str | None = None
 ) -> dict:
     """Adjust tonal curves for a layer.
@@ -685,7 +719,9 @@ def adjust_curves(
     - preset: Built-in curve shape — "s_curve" (default), "lighten", "darken", "contrast"
     - points: Custom control points as [[input, output], ...] override (overrides preset)
     - channel: "value" (all), "red", "green", "blue", "alpha"
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
     - layer_name: Layer to adjust; defaults to active layer
 
     Returns status dict.
@@ -696,7 +732,7 @@ def adjust_curves(
             "preset": preset,
             "points": points,
             "channel": channel,
-            "image_index": image_index,
+            "image": image,
             "layer_name": layer_name,
         })
         if result["status"] == "success":
@@ -712,7 +748,7 @@ def adjust_brightness_contrast(
     ctx: Context,
     brightness: int = 0,
     contrast: int = 0,
-    image_index: int = 0,
+    image: str | int | None = None,
     layer_name: str | None = None
 ) -> dict:
     """Adjust brightness and contrast of a layer.
@@ -720,7 +756,9 @@ def adjust_brightness_contrast(
     Parameters:
     - brightness: -127 to +127 (default 0)
     - contrast: -127 to +127 (default 0)
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
     - layer_name: Layer to adjust; defaults to active layer
 
     Returns status dict.
@@ -730,7 +768,7 @@ def adjust_brightness_contrast(
         result = conn.send_command("adjust_brightness_contrast", {
             "brightness": brightness,
             "contrast": contrast,
-            "image_index": image_index,
+            "image": image,
             "layer_name": layer_name,
         })
         if result["status"] == "success":
@@ -748,7 +786,7 @@ def adjust_hue_saturation(
     saturation: float = 0,
     lightness: float = 0,
     color_range: str = "all",
-    image_index: int = 0,
+    image: str | int | None = None,
     layer_name: str | None = None
 ) -> dict:
     """Adjust hue, saturation, and lightness of a layer.
@@ -758,7 +796,9 @@ def adjust_hue_saturation(
     - saturation: Saturation shift -100 to +100 (default 0)
     - lightness: Lightness shift -100 to +100 (default 0)
     - color_range: "all", "red", "yellow", "green", "cyan", "blue", "magenta" (default "all")
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
     - layer_name: Layer to adjust; defaults to active layer
 
     Returns status dict.
@@ -770,7 +810,7 @@ def adjust_hue_saturation(
             "saturation": saturation,
             "lightness": lightness,
             "color_range": color_range,
-            "image_index": image_index,
+            "image": image,
             "layer_name": layer_name,
         })
         if result["status"] == "success":
@@ -788,7 +828,7 @@ def adjust_color_balance(
     magenta_green: float = 0,
     yellow_blue: float = 0,
     range: str = "midtones",
-    image_index: int = 0,
+    image: str | int | None = None,
     layer_name: str | None = None
 ) -> dict:
     """Adjust color balance (shadows / midtones / highlights) of a layer.
@@ -798,7 +838,9 @@ def adjust_color_balance(
     - magenta_green: -100 to +100 (default 0)
     - yellow_blue: -100 to +100 (default 0)
     - range: "shadows", "midtones" (default), "highlights"
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
     - layer_name: Layer to adjust; defaults to active layer
 
     Returns status dict.
@@ -810,7 +852,7 @@ def adjust_color_balance(
             "magenta_green": magenta_green,
             "yellow_blue": yellow_blue,
             "range": range,
-            "image_index": image_index,
+            "image": image,
             "layer_name": layer_name,
         })
         if result["status"] == "success":
@@ -827,7 +869,7 @@ def sharpen(
     amount: float = 50.0,
     radius: float = 3.0,
     threshold: int = 0,
-    image_index: int = 0,
+    image: str | int | None = None,
     layer_name: str | None = None
 ) -> dict:
     """Sharpen a layer using unsharp mask.
@@ -836,7 +878,9 @@ def sharpen(
     - amount: Sharpening strength 0-500 (default 50.0)
     - radius: Blur radius for the mask in pixels (default 3.0)
     - threshold: Minimum difference before sharpening is applied (default 0)
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
     - layer_name: Layer to sharpen; defaults to active layer
 
     Returns status dict.
@@ -847,7 +891,7 @@ def sharpen(
             "amount": amount,
             "radius": radius,
             "threshold": threshold,
-            "image_index": image_index,
+            "image": image,
             "layer_name": layer_name,
         })
         if result["status"] == "success":
@@ -863,7 +907,7 @@ def blur(
     ctx: Context,
     radius_x: float = 5.0,
     radius_y: float = 5.0,
-    image_index: int = 0,
+    image: str | int | None = None,
     layer_name: str | None = None
 ) -> dict:
     """Apply Gaussian blur to a layer.
@@ -871,7 +915,9 @@ def blur(
     Parameters:
     - radius_x: Horizontal blur radius in pixels (default 5.0)
     - radius_y: Vertical blur radius in pixels (default 5.0)
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
     - layer_name: Layer to blur; defaults to active layer
 
     Returns status dict.
@@ -881,7 +927,7 @@ def blur(
         result = conn.send_command("blur", {
             "radius_x": radius_x,
             "radius_y": radius_y,
-            "image_index": image_index,
+            "image": image,
             "layer_name": layer_name,
         })
         if result["status"] == "success":
@@ -896,14 +942,16 @@ def blur(
 def denoise(
     ctx: Context,
     strength: int = 50,
-    image_index: int = 0,
+    image: str | int | None = None,
     layer_name: str | None = None
 ) -> dict:
     """Reduce noise in a layer using GEGL noise-reduction.
 
     Parameters:
     - strength: Noise reduction strength 0-100 (default 50)
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
     - layer_name: Layer to denoise; defaults to active layer
 
     Returns status dict.
@@ -912,7 +960,7 @@ def denoise(
         conn = get_gimp_connection()
         result = conn.send_command("denoise", {
             "strength": strength,
-            "image_index": image_index,
+            "image": image,
             "layer_name": layer_name,
         })
         if result["status"] == "success":
@@ -927,14 +975,16 @@ def denoise(
 def desaturate(
     ctx: Context,
     mode: str = "luminosity",
-    image_index: int = 0,
+    image: str | int | None = None,
     layer_name: str | None = None
 ) -> dict:
     """Convert a layer to grayscale (desaturate).
 
     Parameters:
     - mode: Desaturation algorithm — "luminosity" (default), "luma", "average", "lightness"
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
     - layer_name: Layer to desaturate; defaults to active layer
 
     Returns status dict.
@@ -943,7 +993,7 @@ def desaturate(
         conn = get_gimp_connection()
         result = conn.send_command("desaturate", {
             "mode": mode,
-            "image_index": image_index,
+            "image": image,
             "layer_name": layer_name,
         })
         if result["status"] == "success":
@@ -957,13 +1007,15 @@ def desaturate(
 @mcp.tool()
 def invert_colors(
     ctx: Context,
-    image_index: int = 0,
+    image: str | int | None = None,
     layer_name: str | None = None
 ) -> dict:
     """Invert all colors in a layer (create a negative).
 
     Parameters:
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
     - layer_name: Layer to invert; defaults to active layer
 
     Returns status dict.
@@ -971,7 +1023,7 @@ def invert_colors(
     try:
         conn = get_gimp_connection()
         result = conn.send_command("invert_colors", {
-            "image_index": image_index,
+            "image": image,
             "layer_name": layer_name,
         })
         if result["status"] == "success":
@@ -992,7 +1044,7 @@ def scale_image(
     width: int,
     height: int,
     interpolation: str = "cubic",
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Scale an image to exact pixel dimensions.
 
@@ -1000,7 +1052,9 @@ def scale_image(
     - width: Target width in pixels
     - height: Target height in pixels
     - interpolation: "cubic" (default), "linear", "none"
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns: {status, width, height}
     """
@@ -1010,7 +1064,7 @@ def scale_image(
             "width": width,
             "height": height,
             "interpolation": interpolation,
-            "image_index": image_index,
+            "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1026,7 +1080,7 @@ def scale_to_fit(
     max_width: int,
     max_height: int,
     interpolation: str = "cubic",
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Scale an image to fit within a bounding box, preserving aspect ratio.
 
@@ -1034,7 +1088,9 @@ def scale_to_fit(
     - max_width: Maximum allowed width in pixels
     - max_height: Maximum allowed height in pixels
     - interpolation: "cubic" (default), "linear", "none"
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns: {status, width, height} — final dimensions after scaling
     """
@@ -1044,7 +1100,7 @@ def scale_to_fit(
             "max_width": max_width,
             "max_height": max_height,
             "interpolation": interpolation,
-            "image_index": image_index,
+            "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1058,13 +1114,15 @@ def scale_to_fit(
 def crop_to_selection(
     ctx: Context,
     autocrop: bool = False,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Crop the image canvas to the current selection bounds.
 
     Parameters:
     - autocrop: If True, auto-detect crop bounds instead of using selection (default False)
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns: {status, x, y, width, height} — crop region applied
     """
@@ -1072,7 +1130,7 @@ def crop_to_selection(
         conn = get_gimp_connection()
         result = conn.send_command("crop_to_selection", {
             "autocrop": autocrop,
-            "image_index": image_index,
+            "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1089,14 +1147,16 @@ def crop_to_rect(
     y: int,
     width: int,
     height: int,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Crop the image canvas to an explicit rectangle.
 
     Parameters:
     - x, y: Top-left corner of the crop rectangle
     - width, height: Dimensions of the crop rectangle
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns: {status, x, y, width, height}
     """
@@ -1107,7 +1167,7 @@ def crop_to_rect(
             "y": y,
             "width": width,
             "height": height,
-            "image_index": image_index,
+            "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1121,14 +1181,16 @@ def crop_to_rect(
 def rotate_image(
     ctx: Context,
     angle: float,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Rotate the entire image.
 
     Parameters:
     - angle: Rotation in degrees — 90, 180, 270 use lossless GIMP rotation;
              other values rotate all layers with interpolation and flatten
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
@@ -1136,7 +1198,7 @@ def rotate_image(
         conn = get_gimp_connection()
         result = conn.send_command("rotate_image", {
             "angle": angle,
-            "image_index": image_index,
+            "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1150,13 +1212,15 @@ def rotate_image(
 def flip_image(
     ctx: Context,
     direction: str = "horizontal",
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Flip the entire image horizontally or vertically.
 
     Parameters:
     - direction: "horizontal" (default) or "vertical"
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
@@ -1164,7 +1228,7 @@ def flip_image(
         conn = get_gimp_connection()
         result = conn.send_command("flip_image", {
             "direction": direction,
-            "image_index": image_index,
+            "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1181,7 +1245,7 @@ def resize_canvas(
     height: int,
     anchor: str = "center",
     fill: str = "transparent",
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Resize the image canvas without scaling the content.
 
@@ -1190,7 +1254,9 @@ def resize_canvas(
     - anchor: Position of existing content — "center" (default), "top-left", "top",
               "top-right", "left", "right", "bottom-left", "bottom", "bottom-right"
     - fill: Color for new canvas areas — CSS color or "transparent"
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns: {status, width, height, offset_x, offset_y}
     """
@@ -1201,7 +1267,7 @@ def resize_canvas(
             "height": height,
             "anchor": anchor,
             "fill": fill,
-            "image_index": image_index,
+            "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1224,7 +1290,7 @@ def select_rectangle(
     height: int,
     operation: str = "replace",
     feather: float = 0,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Create a rectangular selection.
 
@@ -1233,7 +1299,9 @@ def select_rectangle(
     - width, height: Dimensions of the selection
     - operation: "replace" (default), "add", "subtract", "intersect"
     - feather: Feather radius in pixels (default 0 = no feather)
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
@@ -1241,7 +1309,7 @@ def select_rectangle(
         conn = get_gimp_connection()
         result = conn.send_command("select_rectangle", {
             "x": x, "y": y, "width": width, "height": height,
-            "operation": operation, "feather": feather, "image_index": image_index,
+            "operation": operation, "feather": feather, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1260,7 +1328,7 @@ def select_ellipse(
     height: int,
     operation: str = "replace",
     feather: float = 0,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Create an elliptical selection.
 
@@ -1269,7 +1337,9 @@ def select_ellipse(
     - width, height: Bounding box dimensions
     - operation: "replace" (default), "add", "subtract", "intersect"
     - feather: Feather radius in pixels (default 0)
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
@@ -1277,7 +1347,7 @@ def select_ellipse(
         conn = get_gimp_connection()
         result = conn.send_command("select_ellipse", {
             "x": x, "y": y, "width": width, "height": height,
-            "operation": operation, "feather": feather, "image_index": image_index,
+            "operation": operation, "feather": feather, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1293,7 +1363,7 @@ def select_by_color(
     color: str,
     threshold: int = 15,
     operation: str = "replace",
-    image_index: int = 0,
+    image: str | int | None = None,
     layer_name: str | None = None
 ) -> dict:
     """Select regions by color similarity.
@@ -1302,7 +1372,9 @@ def select_by_color(
     - color: Target color as CSS name, hex (#rrggbb), or rgb() string
     - threshold: Color similarity tolerance 0-255 (default 15)
     - operation: "replace" (default), "add", "subtract", "intersect"
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
     - layer_name: Layer to sample from; defaults to active layer
 
     Returns status dict.
@@ -1313,7 +1385,7 @@ def select_by_color(
             "color": color,
             "threshold": threshold,
             "operation": operation,
-            "image_index": image_index,
+            "image": image,
             "layer_name": layer_name,
         })
         if result["status"] == "success":
@@ -1325,17 +1397,19 @@ def select_by_color(
 
 
 @mcp.tool()
-def select_all(ctx: Context, image_index: int = 0) -> dict:
+def select_all(ctx: Context, image: str | int | None = None) -> dict:
     """Select the entire image canvas.
 
     Parameters:
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
     try:
         conn = get_gimp_connection()
-        result = conn.send_command("select_all", {"image_index": image_index})
+        result = conn.send_command("select_all", {"image": image})
         if result["status"] == "success":
             return result["results"]
         raise Exception(result.get("error", "Unknown error"))
@@ -1345,17 +1419,19 @@ def select_all(ctx: Context, image_index: int = 0) -> dict:
 
 
 @mcp.tool()
-def select_none(ctx: Context, image_index: int = 0) -> dict:
+def select_none(ctx: Context, image: str | int | None = None) -> dict:
     """Remove / deselect all selections.
 
     Parameters:
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
     try:
         conn = get_gimp_connection()
-        result = conn.send_command("select_none", {"image_index": image_index})
+        result = conn.send_command("select_none", {"image": image})
         if result["status"] == "success":
             return result["results"]
         raise Exception(result.get("error", "Unknown error"))
@@ -1365,17 +1441,19 @@ def select_none(ctx: Context, image_index: int = 0) -> dict:
 
 
 @mcp.tool()
-def invert_selection(ctx: Context, image_index: int = 0) -> dict:
+def invert_selection(ctx: Context, image: str | int | None = None) -> dict:
     """Invert the current selection (select what is not selected).
 
     Parameters:
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
     try:
         conn = get_gimp_connection()
-        result = conn.send_command("invert_selection", {"image_index": image_index})
+        result = conn.send_command("invert_selection", {"image": image})
         if result["status"] == "success":
             return result["results"]
         raise Exception(result.get("error", "Unknown error"))
@@ -1389,14 +1467,16 @@ def modify_selection(
     ctx: Context,
     operation: str,
     amount: float,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Grow, shrink, feather, border, or sharpen the current selection.
 
     Parameters:
     - operation: "grow", "shrink", "feather", "border", "sharpen"
     - amount: Pixel radius for grow/shrink/feather/border; ignored for sharpen
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
@@ -1405,7 +1485,7 @@ def modify_selection(
         result = conn.send_command("modify_selection", {
             "operation": operation,
             "amount": amount,
-            "image_index": image_index,
+            "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1429,7 +1509,7 @@ def create_layer(
     opacity: float = 100,
     blend_mode: str = "NORMAL",
     position: int = -1,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Create and insert a new layer into an image.
 
@@ -1440,7 +1520,9 @@ def create_layer(
     - opacity: Layer opacity 0-100 (default 100)
     - blend_mode: GIMP layer mode name — "NORMAL" (default), "MULTIPLY", "SCREEN", etc.
     - position: Stack position — -1 = top (default), 0 = bottom
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns: {layer_name, layer_id, width, height, position}
     """
@@ -1449,7 +1531,7 @@ def create_layer(
         result = conn.send_command("create_layer", {
             "name": name, "width": width, "height": height,
             "fill": fill, "opacity": opacity, "blend_mode": blend_mode,
-            "position": position, "image_index": image_index,
+            "position": position, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1463,13 +1545,15 @@ def create_layer(
 def duplicate_layer(
     ctx: Context,
     layer_name: str | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Duplicate a layer and insert the copy above it.
 
     Parameters:
     - layer_name: Name of the layer to duplicate; defaults to active layer
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns: {layer_name, layer_id}
     """
@@ -1477,7 +1561,7 @@ def duplicate_layer(
         conn = get_gimp_connection()
         result = conn.send_command("duplicate_layer", {
             "layer_name": layer_name,
-            "image_index": image_index,
+            "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1492,14 +1576,16 @@ def delete_layer(
     ctx: Context,
     layer_name: str | None = None,
     layer_index: int | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Delete a layer from an image.
 
     Parameters:
     - layer_name: Name of the layer to delete
     - layer_index: Position index of the layer (alternative to layer_name)
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Provide either layer_name or layer_index. Defaults to active layer if neither given.
 
@@ -1510,7 +1596,7 @@ def delete_layer(
         result = conn.send_command("delete_layer", {
             "layer_name": layer_name,
             "layer_index": layer_index,
-            "image_index": image_index,
+            "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1526,7 +1612,7 @@ def rename_layer(
     new_name: str,
     old_name: str | None = None,
     layer_index: int | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Rename a layer.
 
@@ -1534,7 +1620,9 @@ def rename_layer(
     - new_name: New name for the layer
     - old_name: Current name of the layer to rename
     - layer_index: Position index alternative to old_name
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns: {old_name, new_name}
     """
@@ -1544,7 +1632,7 @@ def rename_layer(
             "old_name": old_name,
             "layer_index": layer_index,
             "new_name": new_name,
-            "image_index": image_index,
+            "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1562,7 +1650,7 @@ def set_layer_properties(
     opacity: float | None = None,
     blend_mode: str | None = None,
     visible: bool | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Set properties on an existing layer.
 
@@ -1571,7 +1659,9 @@ def set_layer_properties(
     - opacity: New opacity 0-100 (omit to leave unchanged)
     - blend_mode: New GIMP layer mode name (omit to leave unchanged)
     - visible: True/False visibility (omit to leave unchanged)
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
@@ -1580,7 +1670,7 @@ def set_layer_properties(
         result = conn.send_command("set_layer_properties", {
             "layer_name": layer_name, "layer_index": layer_index,
             "opacity": opacity, "blend_mode": blend_mode,
-            "visible": visible, "image_index": image_index,
+            "visible": visible, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1596,14 +1686,16 @@ def reorder_layer(
     new_position: int,
     layer_name: str | None = None,
     layer_index: int | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Move a layer to a new stack position.
 
     Parameters:
     - new_position: Target stack index (0 = bottom)
     - layer_name / layer_index: Identify the layer (defaults to active layer)
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
@@ -1611,7 +1703,7 @@ def reorder_layer(
         conn = get_gimp_connection()
         result = conn.send_command("reorder_layer", {
             "layer_name": layer_name, "layer_index": layer_index,
-            "new_position": new_position, "image_index": image_index,
+            "new_position": new_position, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1622,17 +1714,19 @@ def reorder_layer(
 
 
 @mcp.tool()
-def flatten_image(ctx: Context, image_index: int = 0) -> dict:
+def flatten_image(ctx: Context, image: str | int | None = None) -> dict:
     """Flatten all layers into a single background layer.
 
     Parameters:
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
     try:
         conn = get_gimp_connection()
-        result = conn.send_command("flatten_image", {"image_index": image_index})
+        result = conn.send_command("flatten_image", {"image": image})
         if result["status"] == "success":
             return result["results"]
         raise Exception(result.get("error", "Unknown error"))
@@ -1642,17 +1736,19 @@ def flatten_image(ctx: Context, image_index: int = 0) -> dict:
 
 
 @mcp.tool()
-def merge_visible_layers(ctx: Context, image_index: int = 0) -> dict:
+def merge_visible_layers(ctx: Context, image: str | int | None = None) -> dict:
     """Merge all visible layers into a single layer.
 
     Parameters:
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns: {layer_name, layer_id}
     """
     try:
         conn = get_gimp_connection()
-        result = conn.send_command("merge_visible_layers", {"image_index": image_index})
+        result = conn.send_command("merge_visible_layers", {"image": image})
         if result["status"] == "success":
             return result["results"]
         raise Exception(result.get("error", "Unknown error"))
@@ -1662,17 +1758,19 @@ def merge_visible_layers(ctx: Context, image_index: int = 0) -> dict:
 
 
 @mcp.tool()
-def list_layers(ctx: Context, image_index: int = 0) -> dict:
+def list_layers(ctx: Context, image: str | int | None = None) -> dict:
     """List all layers in an image with their properties.
 
     Parameters:
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns: {layers: [{name, id, visible, opacity, blend_mode, width, height, has_alpha}], count}
     """
     try:
         conn = get_gimp_connection()
-        result = conn.send_command("list_layers", {"image_index": image_index})
+        result = conn.send_command("list_layers", {"image": image})
         if result["status"] == "success":
             return result["results"]
         raise Exception(result.get("error", "Unknown error"))
@@ -1690,21 +1788,23 @@ def fill_layer(
     ctx: Context,
     color: str,
     layer_name: str | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Fill an entire layer with a solid color.
 
     Parameters:
     - color: Fill color as CSS name, hex, or rgb() string
     - layer_name: Layer to fill; defaults to active layer
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
     try:
         conn = get_gimp_connection()
         result = conn.send_command("fill_layer", {
-            "color": color, "layer_name": layer_name, "image_index": image_index,
+            "color": color, "layer_name": layer_name, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1719,7 +1819,7 @@ def fill_selection(
     ctx: Context,
     color: str | None = None,
     fill_type: str | None = None,
-    image_index: int = 0,
+    image: str | int | None = None,
     layer_name: str | None = None
 ) -> dict:
     """Fill the current selection with a color or fill type.
@@ -1727,7 +1827,9 @@ def fill_selection(
     Parameters:
     - color: Fill color as CSS name, hex, or rgb() string (used when fill_type is omitted)
     - fill_type: Fill type override: "foreground", "background", or "transparent"
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
     - layer_name: Target layer; defaults to active layer
 
     Returns status dict.
@@ -1736,7 +1838,7 @@ def fill_selection(
         conn = get_gimp_connection()
         result = conn.send_command("fill_selection", {
             "color": color, "fill_type": fill_type,
-            "image_index": image_index, "layer_name": layer_name,
+            "image": image, "layer_name": layer_name,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1784,7 +1886,7 @@ def draw_line(
     width: float = 2.0,
     tool: str = "pencil",
     layer_name: str | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Draw a straight line on a layer.
 
@@ -1795,7 +1897,9 @@ def draw_line(
     - width: Stroke width in pixels (default 2.0)
     - tool: "pencil" (default, hard edge) or "paintbrush" (soft edge)
     - layer_name: Target layer; defaults to active layer
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
@@ -1804,7 +1908,7 @@ def draw_line(
         result = conn.send_command("draw_line", {
             "x1": x1, "y1": y1, "x2": x2, "y2": y2,
             "color": color, "width": width, "tool": tool,
-            "layer_name": layer_name, "image_index": image_index,
+            "layer_name": layer_name, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1824,7 +1928,7 @@ def draw_rectangle(
     color: str | None = None,
     line_width: float = 2.0,
     layer_name: str | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Draw a rectangle outline (stroke only) on a layer.
 
@@ -1834,7 +1938,9 @@ def draw_rectangle(
     - color: Stroke color; uses current foreground if omitted
     - line_width: Stroke width in pixels (default 2.0)
     - layer_name: Target layer; defaults to active layer
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
@@ -1843,7 +1949,7 @@ def draw_rectangle(
         result = conn.send_command("draw_rectangle", {
             "x": x, "y": y, "width": width, "height": height,
             "color": color, "line_width": line_width,
-            "layer_name": layer_name, "image_index": image_index,
+            "layer_name": layer_name, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1863,7 +1969,7 @@ def draw_ellipse(
     color: str | None = None,
     line_width: float = 2.0,
     layer_name: str | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Draw an ellipse outline (stroke only) on a layer.
 
@@ -1873,7 +1979,9 @@ def draw_ellipse(
     - color: Stroke color; uses current foreground if omitted
     - line_width: Stroke width in pixels (default 2.0)
     - layer_name: Target layer; defaults to active layer
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
@@ -1882,7 +1990,7 @@ def draw_ellipse(
         result = conn.send_command("draw_ellipse", {
             "x": x, "y": y, "width": width, "height": height,
             "color": color, "line_width": line_width,
-            "layer_name": layer_name, "image_index": image_index,
+            "layer_name": layer_name, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1901,7 +2009,7 @@ def fill_rectangle(
     height: int,
     color: str,
     layer_name: str | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Fill a rectangular region with a solid color.
 
@@ -1910,7 +2018,9 @@ def fill_rectangle(
     - width, height: Rectangle dimensions
     - color: Fill color (CSS name, hex, or rgb() string)
     - layer_name: Target layer; defaults to active layer
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
@@ -1918,7 +2028,7 @@ def fill_rectangle(
         conn = get_gimp_connection()
         result = conn.send_command("fill_rectangle", {
             "x": x, "y": y, "width": width, "height": height,
-            "color": color, "layer_name": layer_name, "image_index": image_index,
+            "color": color, "layer_name": layer_name, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1937,7 +2047,7 @@ def fill_ellipse(
     height: int,
     color: str,
     layer_name: str | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Fill an elliptical region with a solid color.
 
@@ -1946,7 +2056,9 @@ def fill_ellipse(
     - width, height: Bounding box dimensions
     - color: Fill color (CSS name, hex, or rgb() string)
     - layer_name: Target layer; defaults to active layer
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
@@ -1954,7 +2066,7 @@ def fill_ellipse(
         conn = get_gimp_connection()
         result = conn.send_command("fill_ellipse", {
             "x": x, "y": y, "width": width, "height": height,
-            "color": color, "layer_name": layer_name, "image_index": image_index,
+            "color": color, "layer_name": layer_name, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -1975,7 +2087,7 @@ def gradient_fill(
     y2: float | None = None,
     gradient_type: str = "linear",
     layer_name: str | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Fill a layer or selection with a gradient.
 
@@ -1986,7 +2098,9 @@ def gradient_fill(
     - x2, y2: Gradient end point (defaults to bottom-right of image)
     - gradient_type: "linear" (default) or "radial"
     - layer_name: Target layer; defaults to active layer
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
@@ -1996,7 +2110,7 @@ def gradient_fill(
             "color1": color1, "color2": color2,
             "x1": x1, "y1": y1, "x2": x2, "y2": y2,
             "gradient_type": gradient_type,
-            "layer_name": layer_name, "image_index": image_index,
+            "layer_name": layer_name, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -2019,7 +2133,7 @@ def add_text(
     font: str = "Sans",
     size: int = 24,
     color: str = "black",
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Add a text layer to an image.
 
@@ -2029,7 +2143,9 @@ def add_text(
     - font: Font family name — "Sans" (default), "Serif", etc.
     - size: Font size in pixels (default 24)
     - color: Text color (CSS name, hex, or rgb() string; default "black")
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns: {layer_name, layer_id, text_width, text_height, position}
     """
@@ -2038,7 +2154,7 @@ def add_text(
         result = conn.send_command("add_text", {
             "text": text, "x": x, "y": y,
             "font": font, "size": size, "color": color,
-            "image_index": image_index,
+            "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -2056,7 +2172,7 @@ def edit_text(
     font: str | None = None,
     size: float | None = None,
     color: str | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Edit an existing text layer's content or formatting.
 
@@ -2066,7 +2182,9 @@ def edit_text(
     - font: New font family (omit to leave unchanged)
     - size: New font size in pixels (omit to leave unchanged)
     - color: New text color (omit to leave unchanged)
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
@@ -2075,7 +2193,7 @@ def edit_text(
         result = conn.send_command("edit_text", {
             "layer_name": layer_name, "text": text,
             "font": font, "size": size, "color": color,
-            "image_index": image_index,
+            "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -2118,7 +2236,7 @@ def apply_drop_shadow(
     color: str = "black",
     opacity: float = 60,
     layer_name: str | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Apply a drop shadow effect to a layer.
 
@@ -2128,7 +2246,9 @@ def apply_drop_shadow(
     - color: Shadow color (default "black")
     - opacity: Shadow opacity 0-100 (default 60)
     - layer_name: Target layer; defaults to active layer
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
@@ -2137,7 +2257,7 @@ def apply_drop_shadow(
         result = conn.send_command("apply_drop_shadow", {
             "offset_x": offset_x, "offset_y": offset_y,
             "blur_radius": blur_radius, "color": color, "opacity": opacity,
-            "layer_name": layer_name, "image_index": image_index,
+            "layer_name": layer_name, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -2152,21 +2272,23 @@ def apply_gaussian_blur(
     ctx: Context,
     radius: float = 5.0,
     layer_name: str | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Apply Gaussian blur as a destructive filter operation.
 
     Parameters:
     - radius: Blur radius in pixels (default 5.0)
     - layer_name: Target layer; defaults to active layer
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
     try:
         conn = get_gimp_connection()
         result = conn.send_command("apply_gaussian_blur", {
-            "radius": radius, "layer_name": layer_name, "image_index": image_index,
+            "radius": radius, "layer_name": layer_name, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -2181,21 +2303,23 @@ def apply_pixelate(
     ctx: Context,
     block_size: int = 10,
     layer_name: str | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Pixelate a layer using a mosaic/block effect.
 
     Parameters:
     - block_size: Size of each mosaic block in pixels (default 10)
     - layer_name: Target layer; defaults to active layer
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
     try:
         conn = get_gimp_connection()
         result = conn.send_command("apply_pixelate", {
-            "block_size": block_size, "layer_name": layer_name, "image_index": image_index,
+            "block_size": block_size, "layer_name": layer_name, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -2212,7 +2336,7 @@ def apply_emboss(
     elevation: float = 45,
     depth: float = 2,
     layer_name: str | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Apply an emboss (bas-relief) effect to a layer.
 
@@ -2221,7 +2345,9 @@ def apply_emboss(
     - elevation: Light elevation angle 0-90 (default 45)
     - depth: Effect depth/intensity (default 2)
     - layer_name: Target layer; defaults to active layer
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
@@ -2229,7 +2355,7 @@ def apply_emboss(
         conn = get_gimp_connection()
         result = conn.send_command("apply_emboss", {
             "azimuth": azimuth, "elevation": elevation, "depth": depth,
-            "layer_name": layer_name, "image_index": image_index,
+            "layer_name": layer_name, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -2245,7 +2371,7 @@ def apply_vignette(
     softness: float = 3.0,
     shape: float = 1.0,
     layer_name: str | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Apply a vignette darkening effect around the edges of a layer.
 
@@ -2253,7 +2379,9 @@ def apply_vignette(
     - softness: Edge softness / fade width (default 3.0)
     - shape: Shape factor — 1.0 = elliptical (default), values >1 = more rectangular
     - layer_name: Target layer; defaults to active layer
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
@@ -2261,7 +2389,7 @@ def apply_vignette(
         conn = get_gimp_connection()
         result = conn.send_command("apply_vignette", {
             "softness": softness, "shape": shape,
-            "layer_name": layer_name, "image_index": image_index,
+            "layer_name": layer_name, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -2276,21 +2404,23 @@ def apply_noise(
     ctx: Context,
     amount: float = 0.2,
     layer_name: str | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Add noise/grain to a layer.
 
     Parameters:
     - amount: Noise intensity 0.0-1.0 (default 0.2)
     - layer_name: Target layer; defaults to active layer
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
     try:
         conn = get_gimp_connection()
         result = conn.send_command("apply_noise", {
-            "amount": amount, "layer_name": layer_name, "image_index": image_index,
+            "amount": amount, "layer_name": layer_name, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -2309,7 +2439,7 @@ def export_icon_sizes(
     ctx: Context,
     output_dir: str,
     platform: str = "android",
-    source_image_index: int = 0,
+    source_image: str | int | None = None,
     format: str = "png"
 ) -> dict:
     """Export an image as a complete icon set for Android or iOS.
@@ -2321,7 +2451,8 @@ def export_icon_sizes(
     Parameters:
     - output_dir: Directory to write icon files into
     - platform: "android" (default) or "ios"
-    - source_image_index: Image to use as source (default 0)
+    - source_image: Source image handle, image_id, file path or label
+      (default: this session's current image)
     - format: Output format — "png" (default)
 
     Returns: {exported: [{size, file_path}], count, platform}
@@ -2330,7 +2461,7 @@ def export_icon_sizes(
         conn = get_gimp_connection()
         result = conn.send_command("export_icon_sizes", {
             "output_dir": output_dir, "platform": platform,
-            "source_image_index": source_image_index, "format": format,
+            "source_image": source_image, "format": format,
         })
         if result["status"] == "success":
             return result["results"]
@@ -2348,7 +2479,7 @@ def export_web_optimized(
     png_compression: int = 9,
     max_width: int | None = None,
     max_height: int | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Export an image as both JPEG and PNG, choosing the smaller format.
 
@@ -2357,7 +2488,9 @@ def export_web_optimized(
     - jpeg_quality: JPEG quality 1-100 (default 85)
     - png_compression: PNG compression level 0-9 (default 9)
     - max_width / max_height: Optional scaling before export
-    - image_index: Source image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns: {jpeg_path, jpeg_size, png_path, png_size, recommendation}
     """
@@ -2369,7 +2502,7 @@ def export_web_optimized(
             "png_compression": png_compression,
             "max_width": max_width,
             "max_height": max_height,
-            "image_index": image_index,
+            "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -2383,7 +2516,7 @@ def export_web_optimized(
 def warp_region(
     ctx: Context,
     vectors: list,
-    image_index: int = 0,
+    image: str | int | None = None,
     layer_name: str | None = None,
 ) -> dict:
     """Warp / liquify a region of the image by pushing pixels in a direction.
@@ -2398,7 +2531,9 @@ def warp_region(
         - dx, dy    : push direction — negative dy = push upward
         - radius    : influence radius in pixels (default: 40)
         - amount    : deform strength 0–1 (default: 0.3)
-    - image_index: Which open image to edit (default: 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
     - layer_name: Target layer; omit to use the active/top layer
 
     Examples — make a character smile:
@@ -2413,7 +2548,7 @@ def warp_region(
     try:
         conn = get_gimp_connection()
         result = conn.send_command("warp_region", {
-            "image_index": image_index,
+            "image": image,
             "layer_name":  layer_name,
             "vectors":     vectors,
         })
@@ -2463,7 +2598,7 @@ def export_sprite_sheet(
     columns: int | None = None,
     padding: int = 0,
     source: str = "layers",
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Combine multiple frames into a sprite sheet PNG.
 
@@ -2472,7 +2607,9 @@ def export_sprite_sheet(
     - columns: Number of columns in the grid (defaults to square root of frame count)
     - padding: Pixel gap between frames (default 0)
     - source: "layers" (each layer is a frame; default) or "images" (each open image)
-    - image_index: Source image when source="layers" (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns: {file_path, columns, rows, frame_width, frame_height, count}
     """
@@ -2480,7 +2617,7 @@ def export_sprite_sheet(
         conn = get_gimp_connection()
         result = conn.send_command("export_sprite_sheet", {
             "output_path": output_path, "columns": columns,
-            "padding": padding, "source": source, "image_index": image_index,
+            "padding": padding, "source": source, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -2495,7 +2632,7 @@ def export_social_media_kit(
     ctx: Context,
     output_dir: str,
     platforms: list | None = None,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Export an image resized for multiple social media platforms.
 
@@ -2509,14 +2646,16 @@ def export_social_media_kit(
     Parameters:
     - output_dir: Directory to write output files
     - platforms: List of platform names to export (omit for all five)
-    - image_index: Source image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns: {exported: [{platform, file_path, width, height}], count}
     """
     try:
         conn = get_gimp_connection()
         result = conn.send_command("export_social_media_kit", {
-            "output_dir": output_dir, "platforms": platforms, "image_index": image_index,
+            "output_dir": output_dir, "platforms": platforms, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -2531,17 +2670,27 @@ def export_social_media_kit(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def list_images(ctx: Context) -> dict:
-    """List all images currently open in GIMP.
+def list_images(ctx: Context, mine_only: bool = False) -> dict:
+    """List images open in GIMP, marking which ones belong to this session.
+
+    One GIMP can be shared by several sessions at once, so this reports
+    ownership rather than a bare list. Address images by `handle`, never by
+    position: the list reorders as images open and close.
+
+    Parameters:
+    - mine_only: If True, list only images this session opened (default False)
 
     Returns:
-    - images: list of {index, image_id, name, width, height, color_mode,
-                       num_layers, file_path, is_dirty}
-    - count: total number of open images
+    - images: list of {handle, image_id, label, name, width, height, color_mode,
+              num_layers, file_path, is_dirty, session, origin, mine, tracked}
+    - count: images returned
+    - total_open: images open in GIMP overall
+    - session: this session's id
+    - current: image_id this session will act on when you omit `image`
     """
     try:
         conn = get_gimp_connection()
-        result = conn.send_command("list_images", {})
+        result = conn.send_command("list_images", {"mine_only": mine_only})
         if result["status"] == "success":
             return result["results"]
         raise Exception(result.get("error", "Unknown error"))
@@ -2551,17 +2700,121 @@ def list_images(ctx: Context) -> dict:
 
 
 @mcp.tool()
-def set_active_image(ctx: Context, image_index: int) -> dict:
+def session_info(ctx: Context) -> dict:
+    """Report what this session owns in GIMP and what it will act on next.
+
+    Use this to orient yourself at the start of a task, or whenever a tool
+    reports an ambiguous image. GIMP may be shared with other sessions; only
+    the images under `my_images` are yours to edit or close.
+
+    Returns:
+    - session: this session's id
+    - current: image_id used when a tool's `image` argument is omitted
+    - my_images / my_count: images this session opened
+    - other_images / other_count: images belonging to others, or untracked
+    - total_open: images open in GIMP overall
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("session_info", {})
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"session_info failed: {e}")
+
+
+@mcp.tool()
+def close_my_images(ctx: Context, force: bool = False) -> dict:
+    """Close every image this session opened, leaving other sessions' alone.
+
+    The right way to clean up at the end of a task. Images opened by another
+    session, or by hand in the GIMP window, are never touched.
+
+    Parameters:
+    - force: Also close images whose window this server did not create. This
+      reseats every open image onto a fresh window first: nothing is lost, but
+      window position and zoom are reset for all of them.
+
+    Returns: {session, closed, closed_count, failed, failed_count, remaining_open}
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("close_my_images", {"force": force})
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"close_my_images failed: {e}")
+
+
+@mcp.tool()
+def adopt_image(ctx: Context, image: str | int, label: str | None = None) -> dict:
+    """Claim an image that was opened by hand in GIMP, giving it a handle.
+
+    An image opened through GIMP's own File > Open has no handle and belongs to
+    nobody. Adopting it assigns a handle and marks it as this session's, so the
+    rest of the tools can address it and close_my_images will clean it up.
+
+    Parameters:
+    - image: The image to claim, by image_id, file path or GIMP name
+      (see list_images for what is open)
+    - label: Optional friendly name; defaults to the file's base name
+
+    Returns the adopted image's summary, including its new handle.
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("adopt_image", {"image": image, "label": label})
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"adopt_image failed: {e}")
+
+
+@mcp.tool()
+def reseat_displays(ctx: Context) -> dict:
+    """Take ownership of every open image's window so they can all be closed.
+
+    GIMP offers no way to look up which window shows which image, so this
+    server can only close windows it opened itself. This recreates one window
+    per open image and records it, making every image closable.
+
+    No image is lost -- each gets its new window before any old one is removed
+    -- but window position and zoom are reset for all of them, so only run it
+    when you actually need to close an image this server did not open.
+
+    Returns: {tracked_before, tracked_after, images}
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("reseat_displays", {})
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"reseat_displays failed: {e}")
+
+
+@mcp.tool()
+def set_active_image(ctx: Context, image: str | int) -> dict:
     """Raise a specific image to the front / make it active in GIMP.
 
     Parameters:
-    - image_index: Index of the image to activate (from list_images)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
     try:
         conn = get_gimp_connection()
-        result = conn.send_command("set_active_image", {"image_index": image_index})
+        result = conn.send_command("set_active_image", {"image": image})
         if result["status"] == "success":
             return result["results"]
         raise Exception(result.get("error", "Unknown error"))
@@ -2571,18 +2824,20 @@ def set_active_image(ctx: Context, image_index: int) -> dict:
 
 
 @mcp.tool()
-def undo(ctx: Context, steps: int = 1, image_index: int = 0) -> dict:
+def undo(ctx: Context, steps: int = 1, image: str | int | None = None) -> dict:
     """Undo one or more operations on an image.
 
     Parameters:
     - steps: Number of undo steps (default 1)
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns: {steps_undone}
     """
     try:
         conn = get_gimp_connection()
-        result = conn.send_command("undo", {"steps": steps, "image_index": image_index})
+        result = conn.send_command("undo", {"steps": steps, "image": image})
         if result["status"] == "success":
             return result["results"]
         raise Exception(result.get("error", "Unknown error"))
@@ -2592,18 +2847,20 @@ def undo(ctx: Context, steps: int = 1, image_index: int = 0) -> dict:
 
 
 @mcp.tool()
-def redo(ctx: Context, steps: int = 1, image_index: int = 0) -> dict:
+def redo(ctx: Context, steps: int = 1, image: str | int | None = None) -> dict:
     """Redo one or more previously undone operations on an image.
 
     Parameters:
     - steps: Number of redo steps (default 1)
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns: {steps_redone}
     """
     try:
         conn = get_gimp_connection()
-        result = conn.send_command("redo", {"steps": steps, "image_index": image_index})
+        result = conn.send_command("redo", {"steps": steps, "image": image})
         if result["status"] == "success":
             return result["results"]
         raise Exception(result.get("error", "Unknown error"))
@@ -2617,21 +2874,23 @@ def convert_color_mode(
     ctx: Context,
     mode: str,
     num_colors: int = 256,
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Convert an image to a different color mode.
 
     Parameters:
     - mode: "RGB", "GRAY", or "INDEXED"
     - num_colors: Number of colors for INDEXED mode (default 256)
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns status dict.
     """
     try:
         conn = get_gimp_connection()
         result = conn.send_command("convert_color_mode", {
-            "mode": mode, "num_colors": num_colors, "image_index": image_index,
+            "mode": mode, "num_colors": num_colors, "image": image,
         })
         if result["status"] == "success":
             return result["results"]
@@ -2644,21 +2903,27 @@ def convert_color_mode(
 @mcp.tool()
 def close_image(
     ctx: Context,
-    image_index: int = 0,
-    save_first: bool = False
+    image: str | int | None = None,
+    save_first: bool = False,
+    force: bool = False
 ) -> dict:
     """Close an image, optionally saving as XCF first.
 
     Parameters:
-    - image_index: Index of the image to close (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
     - save_first: If True, save as XCF before closing (default False)
+    - force: Only needed for an image this server did not open. Reseats every
+      open image onto a fresh window first so the target can be closed. No
+      image is lost, but window position and zoom are reset for all of them.
 
-    Returns status dict.
+    Returns: {closed, handle, image_id, method, saved_to, remaining_open}
     """
     try:
         conn = get_gimp_connection()
         result = conn.send_command("close_image", {
-            "image_index": image_index, "save_first": save_first,
+            "image": image, "save_first": save_first, "force": force,
         })
         if result["status"] == "success":
             return result["results"]
@@ -2669,17 +2934,19 @@ def close_image(
 
 
 @mcp.tool()
-def get_selection_bounds(ctx: Context, image_index: int = 0) -> dict:
+def get_selection_bounds(ctx: Context, image: str | int | None = None) -> dict:
     """Get the bounding rectangle of the current selection.
 
     Parameters:
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns: {has_selection, x, y, width, height}
     """
     try:
         conn = get_gimp_connection()
-        result = conn.send_command("get_selection_bounds", {"image_index": image_index})
+        result = conn.send_command("get_selection_bounds", {"image": image})
         if result["status"] == "success":
             return result["results"]
         raise Exception(result.get("error", "Unknown error"))
@@ -2693,14 +2960,16 @@ def get_pixel_color(
     ctx: Context,
     x: int,
     y: int,
-    image_index: int = 0,
+    image: str | int | None = None,
     layer_name: str | None = None
 ) -> dict:
     """Get the color of a single pixel.
 
     Parameters:
     - x, y: Pixel coordinates
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
     - layer_name: Layer to sample from; defaults to active layer
 
     Returns: {color_hex, color_rgb: [r, g, b], alpha}
@@ -2708,7 +2977,7 @@ def get_pixel_color(
     try:
         conn = get_gimp_connection()
         result = conn.send_command("get_pixel_color", {
-            "x": x, "y": y, "image_index": image_index, "layer_name": layer_name,
+            "x": x, "y": y, "image": image, "layer_name": layer_name,
         })
         if result["status"] == "success":
             return result["results"]
@@ -2722,20 +2991,22 @@ def get_pixel_color(
 def get_histogram(
     ctx: Context,
     channel: str = "value",
-    image_index: int = 0
+    image: str | int | None = None
 ) -> dict:
     """Get histogram statistics for a channel of the active layer.
 
     Parameters:
     - channel: "value" (all; default), "red", "green", "blue", "alpha"
-    - image_index: Target image index (default 0)
+    - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
+          a GIMP image_id, a file path, or a label. Omit it to use this session's
+          current image (the last one you touched).
 
     Returns: {mean, median, std_dev, min, max, pixels, count}
     """
     try:
         conn = get_gimp_connection()
         result = conn.send_command("get_histogram", {
-            "channel": channel, "image_index": image_index,
+            "channel": channel, "image": image,
         })
         if result["status"] == "success":
             return result["results"]

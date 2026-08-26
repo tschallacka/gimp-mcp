@@ -23,12 +23,59 @@ import base64
 import tempfile
 import os
 import platform
+import re
 import signal
+import time
 
 # Constants for configuration and thresholds
 LARGE_SCALING_THRESHOLD = 4.0  # Warn if scaling ratio exceeds this value
 MAX_REGION_SIZE = 8192  # Maximum region dimension in pixels
 DEFAULT_TIMEOUT_SECONDS = 30  # Default timeout for operations
+
+# Image identity. Every image the MCP creates or opens carries a parasite under
+# this name holding its handle and owning session, so identity survives a plugin
+# restart -- an in-memory registry does not.
+MCP_PARASITE = "gimp-mcp"
+ANONYMOUS_SESSION = "anonymous"
+
+# GIMP exposes no way to enumerate displays, only Gimp.Display.id_is_valid()
+# and get_by_id(), so display discovery is a bounded scan over candidate ids.
+MAX_DISPLAY_SCAN = 512
+
+# Settings live next to GIMP's own config so they survive a plugin reinstall.
+CONFIG_NAME = "mcp-server.json"
+DEFAULT_CONFIG = {"autostart": False, "port": 9877, "host": "localhost"}
+
+
+def config_path():
+    return os.path.join(Gimp.directory(), CONFIG_NAME)
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        with open(config_path()) as fh:
+            cfg.update(json.load(fh))
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        print(f"MCP: ignoring unreadable {config_path()}: {exc}")
+    return cfg
+
+
+def save_config(cfg):
+    path = config_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(cfg, fh, indent=2)
+    return path
+
+
+# GIMP 3.0 called this EXTENSION; 3.2 renamed it PERSISTENT. Either one makes
+# GIMP launch the procedure by itself at startup.
+PERSISTENT_PROC = getattr(
+    Gimp.PDBProcType, "PERSISTENT", getattr(Gimp.PDBProcType, "EXTENSION", None)
+)
 
 
 def N_(message): return message
@@ -57,6 +104,12 @@ class MCPPlugin(Gimp.PlugIn):
         exec("from gi.repository import Gimp", self.context)
         self.auto_disconnect_client = True
 
+        # image_id -> display_id, recorded when we create the display. GIMP has
+        # no display->image lookup, so this is the only cheap way back.
+        self._displays = {}
+        # session_id -> image_id most recently acted on by that session
+        self._current = {}
+
     def do_set_i18n(self, procname):
         # Plugin has no translations; tell GIMP so it stops logging
         # "catalog directory does not exist" for every registered procedure.
@@ -64,10 +117,51 @@ class MCPPlugin(Gimp.PlugIn):
 
     def do_query_procedures(self):
         """Register the plugin procedures."""
-        return ["plug-in-mcp-server", "plug-in-mcp-check", "plug-in-mcp-restart"]
+        procs = [
+            "plug-in-mcp-server",
+            "plug-in-mcp-check",
+            "plug-in-mcp-restart",
+            "plug-in-mcp-autostart-toggle",
+        ]
+        # A persistent procedure is launched by GIMP at startup, which is how
+        # the server comes up without anyone opening the Tools menu.
+        if PERSISTENT_PROC is not None:
+            procs.append("extension-mcp-server")
+        return procs
 
     def do_create_procedure(self, name):
         """Define the procedure properties."""
+        if name == "extension-mcp-server":
+            procedure = Gimp.Procedure.new(
+                self, name, PERSISTENT_PROC, self._run_autostart, None
+            )
+            procedure.set_documentation(
+                _("Start the MCP server when GIMP starts"),
+                _("Runs at GIMP startup and starts the MCP server if autostart "
+                  "is enabled in mcp-server.json"),
+                name,
+            )
+            procedure.set_attribution("Viesar Lab", "Viesar Lab", "2026")
+            return procedure
+
+        if name == "plug-in-mcp-autostart-toggle":
+            procedure = Gimp.Procedure.new(
+                self, name, Gimp.PDBProcType.PLUGIN, self._run_autostart_toggle, None
+            )
+            procedure.set_menu_label(_("Toggle MCP Autostart"))
+            procedure.set_documentation(
+                _("Turn 'start MCP server when GIMP starts' on or off"),
+                _("Flips the autostart flag in mcp-server.json and reports the "
+                  "new value in the Error Console"),
+                name,
+            )
+            procedure.set_attribution("Viesar Lab", "Viesar Lab", "2026")
+            procedure.add_enum_argument("run-mode", _("Run mode"), _("The run mode"),
+                                        Gimp.RunMode, Gimp.RunMode.INTERACTIVE,
+                                        GObject.ParamFlags.READWRITE)
+            procedure.add_menu_path('<Image>/Tools/MCP')
+            return procedure
+
         if name == "plug-in-mcp-check":
             procedure = Gimp.Procedure.new(self, name, Gimp.PDBProcType.PLUGIN, self._run_check, None)
             procedure.set_menu_label(_("Check MCP Server"))
@@ -106,6 +200,39 @@ class MCPPlugin(Gimp.PlugIn):
                                     GObject.ParamFlags.READWRITE)
         procedure.add_menu_path('<Image>/Tools/MCP')
         return procedure
+
+    def _run_autostart(self, procedure, config, run_data):
+        """GIMP startup hook: start the server only if the user opted in."""
+        cfg = load_config()
+        if not cfg.get("autostart"):
+            print("MCP: autostart disabled; use Tools > MCP > Start MCP Server.")
+            return procedure.new_return_values(
+                Gimp.PDBStatusType.SUCCESS, GLib.Error()
+            )
+        self.host = cfg.get("host", self.host)
+        self.port = int(cfg.get("port", self.port))
+        print(f"MCP: autostarting server on {self.host}:{self.port}")
+        return self.run(procedure, config, run_data)
+
+    def _run_autostart_toggle(self, procedure, config, run_data):
+        """Menu handler: flip the autostart flag and say what it is now."""
+        cfg = load_config()
+        cfg["autostart"] = not cfg.get("autostart", False)
+        path = save_config(cfg)
+        state = "ENABLED" if cfg["autostart"] else "DISABLED"
+        message = (
+            f"MCP autostart is now {state}.\n"
+            f"Saved to {path}.\n"
+            + ("The server will start automatically next time GIMP starts."
+               if cfg["autostart"] else
+               "Start it by hand with Tools > MCP > Start MCP Server.")
+        )
+        print(message)
+        try:
+            Gimp.message(message)
+        except Exception:
+            pass
+        return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, GLib.Error())
 
     def _run_check(self, procedure, config, run_data):
         """Menu action: print server status."""
@@ -257,7 +384,7 @@ class MCPPlugin(Gimp.PlugIn):
                 params = j.get("params", {})
                 return self._get_current_image_bitmap(params)
             elif "type" in j and j["type"] == "get_image_metadata":
-                return self._get_current_image_metadata()
+                return self._get_current_image_metadata(j.get("params", {}))
             elif "type" in j and j["type"] == "get_gimp_info":
                 return self._get_gimp_info()
             elif "type" in j and j["type"] == "get_context_state":
@@ -411,6 +538,14 @@ class MCPPlugin(Gimp.PlugIn):
                 return self._convert_color_mode(j.get("params", {}))
             elif "type" in j and j["type"] == "close_image":
                 return self._close_image(j.get("params", {}))
+            elif "type" in j and j["type"] == "session_info":
+                return self._session_info(j.get("params", {}))
+            elif "type" in j and j["type"] == "close_my_images":
+                return self._close_my_images(j.get("params", {}))
+            elif "type" in j and j["type"] == "reseat_displays":
+                return self._reseat_displays_cmd(j.get("params", {}))
+            elif "type" in j and j["type"] == "adopt_image":
+                return self._adopt_image(j.get("params", {}))
             elif "type" in j and j["type"] == "get_selection_bounds":
                 return self._get_selection_bounds(j.get("params", {}))
             elif "type" in j and j["type"] == "get_pixel_color":
@@ -511,16 +646,7 @@ class MCPPlugin(Gimp.PlugIn):
             scaled_to_width = region.get("max_width")  # Region scaling uses max_width/max_height
             scaled_to_height = region.get("max_height")
 
-            # Get the current images
-            images = Gimp.get_images()
-            if not images:
-                return {
-                    "status": "error",
-                    "error": "No images are currently open in GIMP"
-                }
-            
-            # Use the first image (most recently active)
-            original_image = images[0]
+            original_image = self._resolve_image(params or {})
             
             # Get original image dimensions
             orig_img_width = original_image.get_width()
@@ -803,21 +929,12 @@ class MCPPlugin(Gimp.PlugIn):
                 "traceback": traceback.format_exc()
             }
 
-    def _get_current_image_metadata(self):
-        """Get comprehensive metadata about the current image without bitmap data."""
+    def _get_current_image_metadata(self, params=None):
+        """Get comprehensive metadata about an image without bitmap data."""
         try:
             print("Getting current image metadata...")
-            
-            # Get the current images
-            images = Gimp.get_images()
-            if not images:
-                return {
-                    "status": "error",
-                    "error": "No images are currently open in GIMP"
-                }
-            
-            # Use the first image (most recently active)
-            image = images[0]
+
+            image = self._resolve_image(params or {})
             
             # Basic image properties
             width = image.get_width()
@@ -1470,14 +1587,20 @@ class MCPPlugin(Gimp.PlugIn):
                 Gimp.context_set_background(bg_color)
                 Gimp.Drawable.edit_fill(layer, Gimp.FillType.BACKGROUND)
 
-            Gimp.Display.new(image)
+            display = Gimp.Display.new(image)
             Gimp.displays_flush()
+
+            identity = self._register_image(
+                image, display, self._session_id(params), "new_canvas", label=name
+            )
 
             print(f"New canvas created: {width}x{height} {color_mode} fill={fill}")
             return {
                 "status": "success",
                 "results": {
+                    "handle": identity["handle"],
                     "image_id": image.get_id(),
+                    "label": name,
                     "width": width,
                     "height": height,
                     "color_mode": color_mode,
@@ -1498,14 +1621,286 @@ class MCPPlugin(Gimp.PlugIn):
     # SHARED HELPERS
     # =========================================================================
 
-    def _get_image(self, image_index):
-        """Return the image at image_index from Gimp.get_images(), raise if none open."""
+    # ---- image identity -----------------------------------------------
+
+    def _session_id(self, params):
+        """Owning session for a request. Clients that send none share one bucket."""
+        sid = params.get("_session")
+        return str(sid) if sid else ANONYMOUS_SESSION
+
+    def _read_identity(self, image):
+        """Return the gimp-mcp parasite payload for an image, {} if it has none."""
+        try:
+            parasite = image.get_parasite(MCP_PARASITE)
+            if parasite is None:
+                return {}
+            return json.loads(bytes(parasite.get_data()).decode("utf-8"))
+        except Exception:
+            return {}
+
+    def _write_identity(self, image, identity):
+        parasite = Gimp.Parasite.new(
+            MCP_PARASITE, 1, json.dumps(identity).encode("utf-8")
+        )
+        image.attach_parasite(parasite)
+
+    def _taken_handles(self):
+        taken = set()
+        for image in Gimp.get_images():
+            handle = self._read_identity(image).get("handle")
+            if handle:
+                taken.add(handle)
+        return taken
+
+    def _next_handle(self, label):
+        """Readable, collision-free handle: 'logo', then 'logo-2', 'logo-3'."""
+        base = re.sub(r"[^a-z0-9]+", "-", str(label or "img").lower()).strip("-")
+        base = base or "img"
+        taken = self._taken_handles()
+        if base not in taken:
+            return base
+        n = 2
+        while f"{base}-{n}" in taken:
+            n += 1
+        return f"{base}-{n}"
+
+    def _register_image(self, image, display, session, origin, label=None):
+        """Give a new image a handle, record its owner and its display."""
+        identity = {
+            "handle": self._next_handle(label or origin),
+            "session": session,
+            "label": label,
+            "origin": origin,
+            "created": time.time(),
+        }
+        self._write_identity(image, identity)
+        if display is not None:
+            try:
+                self._displays[image.get_id()] = display.get_id()
+            except Exception:
+                pass
+        self._current[session] = image.get_id()
+        return identity
+
+    def _image_summary(self, image, session=None, index=None):
+        """One image's identity plus its GIMP properties."""
+        base_type_map = {
+            Gimp.ImageBaseType.RGB:     "RGB",
+            Gimp.ImageBaseType.GRAY:    "Grayscale",
+            Gimp.ImageBaseType.INDEXED: "Indexed",
+        }
+        identity = self._read_identity(image)
+        gio_file = image.get_file()
+        file_path = gio_file.get_path() if gio_file else None
+        owner = identity.get("session")
+        summary = {
+            "handle":     identity.get("handle"),
+            "image_id":   image.get_id(),
+            "label":      identity.get("label"),
+            "name":       image.get_name(),
+            "width":      image.get_width(),
+            "height":     image.get_height(),
+            "color_mode": base_type_map.get(image.get_base_type(), "Unknown"),
+            "num_layers": len(image.get_layers()),
+            "file_path":  file_path,
+            "is_dirty":   image.is_dirty() if hasattr(image, "is_dirty") else None,
+            "session":    owner,
+            "origin":     identity.get("origin"),
+            "tracked":    bool(identity),
+            "has_display": self._displays.get(image.get_id()) is not None,
+        }
+        if session is not None:
+            summary["mine"] = owner == session
+        if index is not None:
+            summary["index"] = index
+        return summary
+
+    def _describe_open(self, session):
+        """Compact 'what is open' line used in resolution error messages."""
+        parts = []
+        for image in Gimp.get_images():
+            identity = self._read_identity(image)
+            handle = identity.get("handle")
+            mine = identity.get("session") == session
+            who = "yours" if mine else ("another session" if identity else "untracked")
+            parts.append(f"{handle or image.get_name()} (id {image.get_id()}, {who})")
+        return "; ".join(parts) if parts else "nothing"
+
+    def _match_image(self, spec, images, session):
+        """Resolve a handle, image_id, file path or image name to one image."""
+        if isinstance(spec, bool):
+            raise RuntimeError(f"Invalid image spec: {spec!r}")
+
+        # image_id, as int or numeric string
+        if isinstance(spec, int) or (
+            isinstance(spec, str) and spec.strip().lstrip("-").isdigit()
+        ):
+            wanted = int(spec)
+            for image in images:
+                if image.get_id() == wanted:
+                    return image
+            raise RuntimeError(
+                f"No open image has image_id {wanted}. "
+                f"Open now: {self._describe_open(session)}"
+            )
+
+        spec = str(spec).strip()
+
+        # handle, preferring one owned by the calling session
+        matches = [im for im in images if self._read_identity(im).get("handle") == spec]
+        if matches:
+            mine = [
+                im for im in matches
+                if self._read_identity(im).get("session") == session
+            ]
+            return (mine or matches)[0]
+
+        # exact file path, then basename
+        for image in images:
+            gio_file = image.get_file()
+            if gio_file and gio_file.get_path() == spec:
+                return image
+        for image in images:
+            gio_file = image.get_file()
+            if gio_file and os.path.basename(gio_file.get_path()) == spec:
+                return image
+
+        # label, then GIMP image name
+        for image in images:
+            if self._read_identity(image).get("label") == spec:
+                return image
+        for image in images:
+            if image.get_name() == spec:
+                return image
+
+        raise RuntimeError(
+            f"No open image matches '{spec}' (tried handle, image_id, file path, "
+            f"label and name). Open now: {self._describe_open(session)}"
+        )
+
+    def _current_image(self, session, images):
+        """The image this session is working on, or a clear error saying why not."""
+        by_id = {im.get_id(): im for im in images}
+
+        current = self._current.get(session)
+        if current in by_id:
+            return by_id[current]
+
+        owned = [
+            im for im in images
+            if self._read_identity(im).get("session") == session
+        ]
+        if len(owned) == 1:
+            return owned[0]
+        if len(owned) > 1:
+            handles = ", ".join(
+                self._read_identity(im).get("handle") or str(im.get_id())
+                for im in owned
+            )
+            raise RuntimeError(
+                f"This session has {len(owned)} images open and no current one; "
+                f"pass image=<handle>. Yours: {handles}"
+            )
+
+        # Nothing of ours is open. Fall back to a lone image only if it is the
+        # only one there -- guessing among several would edit someone else's work.
+        if len(images) == 1:
+            return images[0]
+        raise RuntimeError(
+            f"This session has no image open, and {len(images)} images belong to "
+            f"other sessions; pass image=<handle> explicitly. "
+            f"Open now: {self._describe_open(session)}"
+        )
+
+    def _resolve_image(self, params):
+        """Resolve the image a request targets, and make it this session's current."""
         images = Gimp.get_images()
         if not images:
-            raise RuntimeError("No images are currently open in GIMP")
-        if image_index >= len(images):
-            raise RuntimeError(f"image_index {image_index} out of range (only {len(images)} images open)")
-        return images[image_index]
+            raise RuntimeError(
+                "No images are open in GIMP. Use new_canvas or open_image first."
+            )
+        session = self._session_id(params)
+        spec = params.get("image", None)
+        if spec is None or (isinstance(spec, str) and not spec.strip()):
+            image = self._current_image(session, images)
+        else:
+            image = self._match_image(spec, images, session)
+        self._current[session] = image.get_id()
+        return image
+
+    # ---- display tracking and closing -----------------------------------
+
+    def _valid_display_ids(self):
+        return [i for i in range(1, MAX_DISPLAY_SCAN) if Gimp.Display.id_is_valid(i)]
+
+    def _reseat_displays(self):
+        """Give every open image exactly one display we know the id of.
+
+        GIMP cannot map a display back to its image, so an image opened by hand
+        in the GIMP window has no recorded display and cannot be closed. This
+        recreates one display per image and records it. Every image survives:
+        each gets its new display before any old one is deleted. Window position
+        and zoom are lost, so this only runs on explicit request.
+        """
+        originals = self._valid_display_ids()
+        fresh = {}
+        for image in Gimp.get_images():
+            try:
+                fresh[image.get_id()] = Gimp.Display.new(image).get_id()
+            except Exception:
+                pass
+        keep = set(fresh.values())
+        for display_id in originals:
+            if display_id in keep:
+                continue
+            try:
+                if Gimp.Display.id_is_valid(display_id):
+                    Gimp.Display.get_by_id(display_id).delete()
+            except Exception:
+                pass
+        Gimp.displays_flush()
+        self._displays = dict(fresh)
+        return fresh
+
+    def _forget(self, image_id):
+        for session, current in list(self._current.items()):
+            if current == image_id:
+                del self._current[session]
+
+    def _delete_image(self, image, force=False):
+        """Close one image. Returns the method that worked."""
+        image_id = image.get_id()
+        display_id = self._displays.get(image_id)
+
+        if display_id is not None and Gimp.Display.id_is_valid(display_id):
+            Gimp.Display.get_by_id(display_id).delete()
+            Gimp.displays_flush()
+            if image_id not in [im.get_id() for im in Gimp.get_images()]:
+                self._displays.pop(image_id, None)
+                self._forget(image_id)
+                return "display_deleted"
+
+        # No display of ours, or the image outlived it (extra displays open).
+        if not force:
+            raise RuntimeError(
+                f"Image {image_id} has a display this server did not create, so it "
+                f"cannot be closed directly. Retry with force=true to reseat all "
+                f"displays first (every other image survives, but window position "
+                f"and zoom are reset), or close it in the GIMP window."
+            )
+
+        self._reseat_displays()
+        display_id = self._displays.get(image_id)
+        if display_id is not None and Gimp.Display.id_is_valid(display_id):
+            Gimp.Display.get_by_id(display_id).delete()
+            Gimp.displays_flush()
+
+        if image_id in [im.get_id() for im in Gimp.get_images()]:
+            image.delete()
+            Gimp.displays_flush()
+        self._displays.pop(image_id, None)
+        self._forget(image_id)
+        return "forced"
 
     def _resolve_layer(self, image, layer_name, layer_index):
         """Resolve a layer by name, index, or fall back to the active layer."""
@@ -1637,7 +2032,10 @@ class MCPPlugin(Gimp.PlugIn):
             props_code = ", ".join(f'"{k}", {repr(v)}' for k, v in props.items())
             cmds = [
                 "from gi.repository import Gimp, Gegl",
-                "_img = Gimp.get_images()[0]",
+                # Address the resolved image by id; a positional lookup here
+                # would apply the filter to whichever image GIMP listed first.
+                f"_img = [i for i in Gimp.get_images() "
+                f"if i.get_id() == {image.get_id()}][0]",
                 "_d = (_img.get_selected_layers() or _img.get_layers() or [None])[0]",
                 f"_d.apply_drawable_filter_new('{op_name}', '', [{props_code}])",
                 "Gimp.displays_flush()",
@@ -1666,10 +2064,19 @@ class MCPPlugin(Gimp.PlugIn):
                 Gimp.ImageBaseType.GRAY:    "Grayscale",
                 Gimp.ImageBaseType.INDEXED: "Indexed",
             }
+            label = params.get("label") or os.path.splitext(
+                os.path.basename(file_path)
+            )[0]
+            identity = self._register_image(
+                image, display, self._session_id(params), "open_image", label=label
+            )
             return {
                 "status": "success",
                 "results": {
+                    "handle":        identity["handle"],
                     "image_id":      image.get_id(),
+                    "label":         label,
+                    "file_path":     file_path,
                     "width":         image.get_width(),
                     "height":        image.get_height(),
                     "color_mode":    mode_map.get(base_type, str(base_type)),
@@ -1684,9 +2091,8 @@ class MCPPlugin(Gimp.PlugIn):
         """Save image as XCF."""
         try:
             from gi.repository import Gio
-            image_index = int(params.get("image_index", 0))
             file_path = params.get("file_path", "")
-            image = self._get_image(image_index)
+            image = self._resolve_image(params)
             gio_file = Gio.File.new_for_path(file_path)
             pdb = Gimp.get_pdb()
             proc = pdb.lookup_procedure("gimp-xcf-save")
@@ -1704,12 +2110,11 @@ class MCPPlugin(Gimp.PlugIn):
     def _export_image(self, params):
         """Export image to raster format."""
         try:
-            image_index = int(params.get("image_index", 0))
             file_path   = params.get("file_path", "")
             fmt         = params.get("format", "png")
             quality     = int(params.get("quality", 90))
             flatten     = bool(params.get("flatten", True))
-            image = self._get_image(image_index)
+            image = self._resolve_image(params)
             file_size = self._export_to_path(image, file_path, fmt, quality, flatten)
             Gimp.displays_flush()
             return {
@@ -1731,15 +2136,23 @@ class MCPPlugin(Gimp.PlugIn):
             fmt          = params.get("format", "png")
             quality      = int(params.get("quality", 90))
             name_pattern = params.get("name_pattern", "{name}")
-            image_index  = params.get("image_index", None)
+            image_spec   = params.get("image", None)
+            mine_only    = bool(params.get("mine_only", False))
+            session      = self._session_id(params)
 
             images = Gimp.get_images()
             if not images:
                 return {"status": "error", "error": "No images open"}
 
-            targets = [(i, img) for i, img in enumerate(images)]
-            if image_index is not None:
-                targets = [(image_index, images[int(image_index)])]
+            if image_spec is not None:
+                targets = [(0, self._match_image(image_spec, images, session))]
+            elif mine_only:
+                targets = [
+                    (i, img) for i, img in enumerate(images)
+                    if self._read_identity(img).get("session") == session
+                ]
+            else:
+                targets = [(i, img) for i, img in enumerate(images)]
 
             os.makedirs(output_dir, exist_ok=True)
             exported = []
@@ -1775,9 +2188,8 @@ class MCPPlugin(Gimp.PlugIn):
     def _auto_levels(self, params):
         """Auto-stretch levels on a drawable."""
         try:
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             image.undo_group_start()
             try:
@@ -1823,13 +2235,12 @@ class MCPPlugin(Gimp.PlugIn):
                 "blue":  Gimp.HistogramChannel.BLUE,
                 "alpha": Gimp.HistogramChannel.ALPHA,
             }
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             preset      = params.get("preset", "s_curve")
             custom_pts  = params.get("points", None)
             channel_str = params.get("channel", "value")
 
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             channel  = CHANNEL_MAP.get(channel_str.lower(), Gimp.HistogramChannel.VALUE)
 
@@ -1875,11 +2286,10 @@ class MCPPlugin(Gimp.PlugIn):
     def _adjust_brightness_contrast(self, params):
         """Adjust brightness and contrast."""
         try:
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             brightness  = float(params.get("brightness", 0))
             contrast    = float(params.get("contrast", 0))
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             image.undo_group_start()
             try:
@@ -1910,13 +2320,12 @@ class MCPPlugin(Gimp.PlugIn):
                 "blue":    Gimp.HueRange.BLUE,
                 "magenta": Gimp.HueRange.MAGENTA,
             }
-            image_index  = int(params.get("image_index", 0))
             layer_name   = params.get("layer_name", None)
             hue          = float(params.get("hue", 0))
             saturation   = float(params.get("saturation", 0))
             lightness    = float(params.get("lightness", 0))
             color_range  = params.get("color_range", "all")
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             hue_range = HUE_RANGE_MAP.get(color_range.lower(), Gimp.HueRange.ALL)
             image.undo_group_start()
@@ -1948,13 +2357,12 @@ class MCPPlugin(Gimp.PlugIn):
                 "midtones":   1,
                 "highlights": 2,
             }
-            image_index    = int(params.get("image_index", 0))
             layer_name     = params.get("layer_name", None)
             cyan_red       = float(params.get("cyan_red", 0))
             magenta_green  = float(params.get("magenta_green", 0))
             yellow_blue    = float(params.get("yellow_blue", 0))
             range_str      = params.get("range", "midtones")
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             color_range = RANGE_MAP.get(range_str.lower(), 1)
             image.undo_group_start()
@@ -1980,12 +2388,11 @@ class MCPPlugin(Gimp.PlugIn):
     def _sharpen(self, params):
         """Sharpen using unsharp mask."""
         try:
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             amount      = float(params.get("amount", 50.0))
             radius      = float(params.get("radius", 3.0))
             threshold   = int(params.get("threshold", 0))
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             image.undo_group_start()
             try:
@@ -2015,11 +2422,10 @@ class MCPPlugin(Gimp.PlugIn):
     def _blur(self, params):
         """Gaussian blur."""
         try:
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             radius_x    = float(params.get("radius_x", 5.0))
             radius_y    = float(params.get("radius_y", 5.0))
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             image.undo_group_start()
             try:
@@ -2048,10 +2454,9 @@ class MCPPlugin(Gimp.PlugIn):
     def _denoise(self, params):
         """Noise reduction."""
         try:
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             strength    = int(params.get("strength", 50))
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             image.undo_group_start()
             try:
@@ -2076,10 +2481,9 @@ class MCPPlugin(Gimp.PlugIn):
                 "average":    Gimp.DesaturateMode.AVERAGE,
                 "lightness":  Gimp.DesaturateMode.LIGHTNESS,
             }
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             mode_str    = params.get("mode", "luminosity")
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             mode = MODE_MAP.get(mode_str.lower(), Gimp.DesaturateMode.LUMINANCE)
             image.undo_group_start()
@@ -2101,9 +2505,8 @@ class MCPPlugin(Gimp.PlugIn):
     def _invert_colors(self, params):
         """Invert all colors in a layer."""
         try:
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             image.undo_group_start()
             try:
@@ -2128,11 +2531,10 @@ class MCPPlugin(Gimp.PlugIn):
     def _scale_image(self, params):
         """Scale image to exact dimensions."""
         try:
-            image_index   = int(params.get("image_index", 0))
             width         = int(params.get("width"))
             height        = int(params.get("height"))
             interpolation = params.get("interpolation", "cubic")
-            image  = self._get_image(image_index)
+            image  = self._resolve_image(params)
             self._interp_from_string(interpolation)
             image.undo_group_start()
             try:
@@ -2147,11 +2549,10 @@ class MCPPlugin(Gimp.PlugIn):
     def _scale_to_fit(self, params):
         """Scale image to fit within a bounding box preserving aspect ratio."""
         try:
-            image_index   = int(params.get("image_index", 0))
             max_width     = int(params.get("max_width"))
             max_height    = int(params.get("max_height"))
             interpolation = params.get("interpolation", "cubic")
-            image  = self._get_image(image_index)
+            image  = self._resolve_image(params)
             self._interp_from_string(interpolation)
             src_w  = image.get_width()
             src_h  = image.get_height()
@@ -2176,9 +2577,8 @@ class MCPPlugin(Gimp.PlugIn):
     def _crop_to_selection(self, params):
         """Crop image to selection bounds."""
         try:
-            image_index = int(params.get("image_index", 0))
             autocrop    = bool(params.get("autocrop", False))
-            image = self._get_image(image_index)
+            image = self._resolve_image(params)
             image.undo_group_start()
             try:
                 if autocrop:
@@ -2202,12 +2602,11 @@ class MCPPlugin(Gimp.PlugIn):
     def _crop_to_rect(self, params):
         """Crop image to explicit rectangle."""
         try:
-            image_index = int(params.get("image_index", 0))
             x      = int(params.get("x", 0))
             y      = int(params.get("y", 0))
             width  = int(params.get("width"))
             height = int(params.get("height"))
-            image = self._get_image(image_index)
+            image = self._resolve_image(params)
             image.undo_group_start()
             try:
                 image.crop(width, height, x, y)
@@ -2221,9 +2620,8 @@ class MCPPlugin(Gimp.PlugIn):
     def _rotate_image(self, params):
         """Rotate image by angle."""
         try:
-            image_index = int(params.get("image_index", 0))
             angle       = float(params.get("angle", 90))
-            image = self._get_image(image_index)
+            image = self._resolve_image(params)
             image.undo_group_start()
             try:
                 rot_map = {
@@ -2259,9 +2657,8 @@ class MCPPlugin(Gimp.PlugIn):
     def _flip_image(self, params):
         """Flip image horizontally or vertically."""
         try:
-            image_index = int(params.get("image_index", 0))
             direction   = params.get("direction", "horizontal").lower()
-            image = self._get_image(image_index)
+            image = self._resolve_image(params)
             orient = Gimp.OrientationType.HORIZONTAL if direction == "horizontal" else Gimp.OrientationType.VERTICAL
             image.undo_group_start()
             try:
@@ -2277,12 +2674,11 @@ class MCPPlugin(Gimp.PlugIn):
         """Resize canvas without scaling content."""
         try:
             from gi.repository import Gegl
-            image_index = int(params.get("image_index", 0))
             new_w  = int(params.get("width"))
             new_h  = int(params.get("height"))
             anchor = params.get("anchor", "center").lower()
             fill   = params.get("fill", "transparent")
-            image  = self._get_image(image_index)
+            image  = self._resolve_image(params)
             src_w  = image.get_width()
             src_h  = image.get_height()
             # Compute offset based on anchor
@@ -2325,14 +2721,13 @@ class MCPPlugin(Gimp.PlugIn):
     def _select_rectangle(self, params):
         """Create a rectangular selection."""
         try:
-            image_index = int(params.get("image_index", 0))
             x       = int(params.get("x", 0))
             y       = int(params.get("y", 0))
             width   = int(params.get("width"))
             height  = int(params.get("height"))
             operation = params.get("operation", "replace")
             feather   = float(params.get("feather", 0))
-            image = self._get_image(image_index)
+            image = self._resolve_image(params)
             op = self._channel_ops_from_string(operation)
             image.select_rectangle(op, x, y, width, height)
             if feather > 0:
@@ -2345,14 +2740,13 @@ class MCPPlugin(Gimp.PlugIn):
     def _select_ellipse(self, params):
         """Create an elliptical selection."""
         try:
-            image_index = int(params.get("image_index", 0))
             x       = int(params.get("x", 0))
             y       = int(params.get("y", 0))
             width   = int(params.get("width"))
             height  = int(params.get("height"))
             operation = params.get("operation", "replace")
             feather   = float(params.get("feather", 0))
-            image = self._get_image(image_index)
+            image = self._resolve_image(params)
             op = self._channel_ops_from_string(operation)
             image.select_ellipse(op, x, y, width, height)
             if feather > 0:
@@ -2366,12 +2760,11 @@ class MCPPlugin(Gimp.PlugIn):
         """Select by color similarity."""
         try:
             from gi.repository import Gegl
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             color_str   = params.get("color", "white")
             threshold   = int(params.get("threshold", 15))
             operation   = params.get("operation", "replace")
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             op = self._channel_ops_from_string(operation)
             color = Gegl.Color.new(color_str)
@@ -2404,7 +2797,7 @@ class MCPPlugin(Gimp.PlugIn):
     def _select_all(self, params):
         """Select entire canvas."""
         try:
-            image = self._get_image(int(params.get("image_index", 0)))
+            image = self._resolve_image(params)
             Gimp.Selection.all(image)
             Gimp.displays_flush()
             return {"status": "success", "results": {"status": "success"}}
@@ -2414,7 +2807,7 @@ class MCPPlugin(Gimp.PlugIn):
     def _select_none(self, params):
         """Remove all selections."""
         try:
-            image = self._get_image(int(params.get("image_index", 0)))
+            image = self._resolve_image(params)
             Gimp.Selection.none(image)
             Gimp.displays_flush()
             return {"status": "success", "results": {"status": "success"}}
@@ -2424,7 +2817,7 @@ class MCPPlugin(Gimp.PlugIn):
     def _invert_selection(self, params):
         """Invert selection."""
         try:
-            image = self._get_image(int(params.get("image_index", 0)))
+            image = self._resolve_image(params)
             Gimp.Selection.invert(image)
             Gimp.displays_flush()
             return {"status": "success", "results": {"status": "success"}}
@@ -2434,10 +2827,9 @@ class MCPPlugin(Gimp.PlugIn):
     def _modify_selection(self, params):
         """Grow/shrink/feather/border/sharpen selection."""
         try:
-            image_index = int(params.get("image_index", 0))
             operation   = params.get("operation", "grow").lower()
             amount      = float(params.get("amount", 0))
-            image = self._get_image(image_index)
+            image = self._resolve_image(params)
             OP_MAP = {
                 "grow":    Gimp.Selection.grow,
                 "shrink":  Gimp.Selection.shrink,
@@ -2487,13 +2879,12 @@ class MCPPlugin(Gimp.PlugIn):
         """Create and insert a new layer."""
         try:
             from gi.repository import Gegl
-            image_index = int(params.get("image_index", 0))
             name        = params.get("name", "New Layer")
             opacity     = float(params.get("opacity", 100))
             blend_mode  = params.get("blend_mode", "NORMAL")
             position    = int(params.get("position", -1))
             fill        = params.get("fill", "transparent")
-            image = self._get_image(image_index)
+            image = self._resolve_image(params)
             width  = int(params.get("width")  or image.get_width())
             height = int(params.get("height") or image.get_height())
             mode   = self._blend_mode_from_string(blend_mode)
@@ -2534,9 +2925,8 @@ class MCPPlugin(Gimp.PlugIn):
     def _duplicate_layer(self, params):
         """Duplicate a layer."""
         try:
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             layer    = self._resolve_layer(image, layer_name, None)
             layers   = image.get_layers()
             position = layers.index(layer) if layer in layers else 0
@@ -2554,12 +2944,11 @@ class MCPPlugin(Gimp.PlugIn):
     def _delete_layer(self, params):
         """Delete a layer."""
         try:
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             layer_index = params.get("layer_index", None)
             if layer_index is not None:
                 layer_index = int(layer_index)
-            image = self._get_image(image_index)
+            image = self._resolve_image(params)
             layer = self._resolve_layer(image, layer_name, layer_index)
             image.undo_group_start()
             try:
@@ -2574,13 +2963,12 @@ class MCPPlugin(Gimp.PlugIn):
     def _rename_layer(self, params):
         """Rename a layer."""
         try:
-            image_index = int(params.get("image_index", 0))
             old_name    = params.get("old_name", None)
             layer_index = params.get("layer_index", None)
             new_name    = params.get("new_name", "")
             if layer_index is not None:
                 layer_index = int(layer_index)
-            image = self._get_image(image_index)
+            image = self._resolve_image(params)
             layer = self._resolve_layer(image, old_name, layer_index)
             prev_name = layer.get_name()
             layer.set_name(new_name)
@@ -2592,7 +2980,6 @@ class MCPPlugin(Gimp.PlugIn):
     def _set_layer_properties(self, params):
         """Set layer opacity, blend mode, and/or visibility."""
         try:
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             layer_index = params.get("layer_index", None)
             opacity     = params.get("opacity", None)
@@ -2600,7 +2987,7 @@ class MCPPlugin(Gimp.PlugIn):
             visible     = params.get("visible", None)
             if layer_index is not None:
                 layer_index = int(layer_index)
-            image = self._get_image(image_index)
+            image = self._resolve_image(params)
             layer = self._resolve_layer(image, layer_name, layer_index)
             image.undo_group_start()
             try:
@@ -2620,13 +3007,12 @@ class MCPPlugin(Gimp.PlugIn):
     def _reorder_layer(self, params):
         """Move a layer to a new stack position."""
         try:
-            image_index  = int(params.get("image_index", 0))
             layer_name   = params.get("layer_name", None)
             layer_index  = params.get("layer_index", None)
             new_position = int(params.get("new_position", 0))
             if layer_index is not None:
                 layer_index = int(layer_index)
-            image = self._get_image(image_index)
+            image = self._resolve_image(params)
             layer = self._resolve_layer(image, layer_name, layer_index)
             image.undo_group_start()
             try:
@@ -2641,7 +3027,7 @@ class MCPPlugin(Gimp.PlugIn):
     def _flatten_image(self, params):
         """Flatten all layers."""
         try:
-            image = self._get_image(int(params.get("image_index", 0)))
+            image = self._resolve_image(params)
             image.undo_group_start()
             try:
                 image.flatten()
@@ -2655,7 +3041,7 @@ class MCPPlugin(Gimp.PlugIn):
     def _merge_visible_layers(self, params):
         """Merge visible layers."""
         try:
-            image = self._get_image(int(params.get("image_index", 0)))
+            image = self._resolve_image(params)
             image.undo_group_start()
             try:
                 merged = image.merge_visible_layers(Gimp.MergeType.CLIP_TO_IMAGE)
@@ -2669,7 +3055,7 @@ class MCPPlugin(Gimp.PlugIn):
     def _list_layers(self, params):
         """List all layers with properties."""
         try:
-            image  = self._get_image(int(params.get("image_index", 0)))
+            image  = self._resolve_image(params)
             layers = image.get_layers()
             layer_list = []
             for i, layer in enumerate(layers):
@@ -2700,10 +3086,9 @@ class MCPPlugin(Gimp.PlugIn):
         """Fill entire layer with color."""
         try:
             from gi.repository import Gegl
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             color_str   = params.get("color", "white")
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             image.undo_group_start()
             Gimp.context_push()
@@ -2725,11 +3110,10 @@ class MCPPlugin(Gimp.PlugIn):
         """Fill current selection with color or transparency."""
         try:
             from gi.repository import Gegl
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             fill_type   = (params.get("fill_type") or "foreground").lower()
             color_str   = params.get("color", "white")
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             image.undo_group_start()
             Gimp.context_push()
@@ -2774,7 +3158,6 @@ class MCPPlugin(Gimp.PlugIn):
         """Draw a straight line."""
         try:
             from gi.repository import Gegl
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             x1 = float(params.get("x1", 0))
             y1 = float(params.get("y1", 0))
@@ -2783,7 +3166,7 @@ class MCPPlugin(Gimp.PlugIn):
             color_str  = params.get("color", None)
             line_width = float(params.get("width", 2.0))
             tool       = params.get("tool", "pencil").lower()
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             image.undo_group_start()
             Gimp.context_push()
@@ -2809,7 +3192,6 @@ class MCPPlugin(Gimp.PlugIn):
         """Draw a rectangle outline."""
         try:
             from gi.repository import Gegl
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             x          = int(params.get("x", 0))
             y          = int(params.get("y", 0))
@@ -2817,7 +3199,7 @@ class MCPPlugin(Gimp.PlugIn):
             height     = int(params.get("height"))
             color_str  = params.get("color", None)
             line_width = float(params.get("line_width", 2.0))
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             image.undo_group_start()
             Gimp.context_push()
@@ -2847,7 +3229,6 @@ class MCPPlugin(Gimp.PlugIn):
         """Draw an ellipse outline."""
         try:
             from gi.repository import Gegl
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             x          = int(params.get("x", 0))
             y          = int(params.get("y", 0))
@@ -2855,7 +3236,7 @@ class MCPPlugin(Gimp.PlugIn):
             height     = int(params.get("height"))
             color_str  = params.get("color", None)
             line_width = float(params.get("line_width", 2.0))
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             image.undo_group_start()
             Gimp.context_push()
@@ -2885,14 +3266,13 @@ class MCPPlugin(Gimp.PlugIn):
         """Fill a rectangular region with color."""
         try:
             from gi.repository import Gegl
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             x       = int(params.get("x", 0))
             y       = int(params.get("y", 0))
             width   = int(params.get("width"))
             height  = int(params.get("height"))
             color_str = params.get("color", "white")
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             image.undo_group_start()
             Gimp.context_push()
@@ -2913,14 +3293,13 @@ class MCPPlugin(Gimp.PlugIn):
         """Fill an elliptical region with color."""
         try:
             from gi.repository import Gegl
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             x       = int(params.get("x", 0))
             y       = int(params.get("y", 0))
             width   = int(params.get("width"))
             height  = int(params.get("height"))
             color_str = params.get("color", "white")
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             image.undo_group_start()
             Gimp.context_push()
@@ -2941,12 +3320,11 @@ class MCPPlugin(Gimp.PlugIn):
         """Fill with a gradient using GEGL (gimp-blend was removed in GIMP 3)."""
         try:
             from gi.repository import Gegl
-            image_index   = int(params.get("image_index", 0))
             layer_name    = params.get("layer_name", None)
             color1        = params.get("color1", "black")
             color2        = params.get("color2", "white")
             gradient_type = params.get("gradient_type", "linear").lower()
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             w = image.get_width()
             h = image.get_height()
@@ -3088,7 +3466,6 @@ class MCPPlugin(Gimp.PlugIn):
         """Add a text layer."""
         try:
             from gi.repository import Gegl
-            image_index = int(params.get("image_index", 0))
             text_str    = params.get("text", "")
             x           = int(params.get("x", 0))
             y           = int(params.get("y", 0))
@@ -3096,7 +3473,7 @@ class MCPPlugin(Gimp.PlugIn):
             size        = int(params.get("size", 24))
             color_str   = params.get("color", "black")
 
-            image      = self._get_image(image_index)
+            image      = self._resolve_image(params)
             before_ids = {lyr.get_id() for lyr in image.get_layers()}
             text_layer = None
 
@@ -3143,13 +3520,12 @@ class MCPPlugin(Gimp.PlugIn):
         """Edit an existing text layer."""
         try:
             from gi.repository import Gegl
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", "")
             new_text    = params.get("text", None)
             new_font    = params.get("font", None)
             new_size    = params.get("size", None)
             new_color   = params.get("color", None)
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             layer    = self._resolve_layer(image, layer_name, None)
             pdb      = Gimp.get_pdb()
             image.undo_group_start()
@@ -3198,7 +3574,7 @@ class MCPPlugin(Gimp.PlugIn):
         pushing corners upward, etc.
 
         params:
-          image_index  — which image
+          image        — handle, image_id, file path or label
           layer_name   — optional layer
           vectors      — list of warp vectors: [{x, y, dx, dy, radius, amount}]
                          x/y: pixel coords of warp center
@@ -3208,10 +3584,9 @@ class MCPPlugin(Gimp.PlugIn):
         """
         try:
             from gi.repository import Gegl
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             vectors     = params.get("vectors", [])
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             pdb      = Gimp.get_pdb()
 
@@ -3326,14 +3701,13 @@ class MCPPlugin(Gimp.PlugIn):
         """
         try:
             from gi.repository import Gegl
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             offset_x    = int(params.get("offset_x", 5))
             offset_y    = int(params.get("offset_y", 5))
             blur_radius = float(params.get("blur_radius", 10))
             color_str   = params.get("color", "black")
             opacity     = float(params.get("opacity", 60))
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             image.undo_group_start()
             try:
@@ -3379,10 +3753,9 @@ class MCPPlugin(Gimp.PlugIn):
     def _apply_gaussian_blur(self, params):
         """Apply Gaussian blur."""
         try:
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             radius      = float(params.get("radius", 5.0))
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             image.undo_group_start()
             try:
@@ -3400,10 +3773,9 @@ class MCPPlugin(Gimp.PlugIn):
     def _apply_pixelate(self, params):
         """Apply pixelate effect."""
         try:
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             block_size  = int(params.get("block_size", 10))
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             image.undo_group_start()
             try:
@@ -3421,12 +3793,11 @@ class MCPPlugin(Gimp.PlugIn):
     def _apply_emboss(self, params):
         """Apply emboss effect."""
         try:
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             azimuth     = float(params.get("azimuth", 315))
             elevation   = float(params.get("elevation", 45))
             depth       = float(params.get("depth", 2))
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             image.undo_group_start()
             try:
@@ -3446,11 +3817,10 @@ class MCPPlugin(Gimp.PlugIn):
     def _apply_vignette(self, params):
         """Apply vignette effect."""
         try:
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             softness    = float(params.get("softness", 3.0))
             shape       = float(params.get("shape", 1.0))
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             image.undo_group_start()
             try:
@@ -3469,10 +3839,9 @@ class MCPPlugin(Gimp.PlugIn):
     def _apply_noise(self, params):
         """Add noise to a layer."""
         try:
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             amount      = float(params.get("amount", 0.2))
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             image.undo_group_start()
             try:
@@ -3497,7 +3866,6 @@ class MCPPlugin(Gimp.PlugIn):
         try:
             output_dir   = params.get("output_dir", "")
             platform_str = params.get("platform", "android").lower()
-            src_index    = int(params.get("source_image_index", 0))
             fmt          = params.get("format", "png")
 
             ANDROID_SIZES = [
@@ -3514,7 +3882,9 @@ class MCPPlugin(Gimp.PlugIn):
                 (1024, 1),
             ]
 
-            source_image = self._get_image(src_index)
+            source_image = self._resolve_image(
+                {"image": params.get("source_image"), "_session": params.get("_session")}
+            )
             os.makedirs(output_dir, exist_ok=True)
             exported = []
             sizes = ANDROID_SIZES if platform_str == "android" else IOS_SIZES
@@ -3556,10 +3926,9 @@ class MCPPlugin(Gimp.PlugIn):
         try:
             output_dir    = params.get("output_dir", "")
             jpeg_quality  = int(params.get("jpeg_quality", 85))
-            image_index   = int(params.get("image_index", 0))
             max_width     = params.get("max_width", None)
             max_height    = params.get("max_height", None)
-            image = self._get_image(image_index)
+            image = self._resolve_image(params)
             os.makedirs(output_dir, exist_ok=True)
 
             dup = image.duplicate()
@@ -3604,7 +3973,24 @@ class MCPPlugin(Gimp.PlugIn):
             height          = params.get("height", None)
             scale_factor    = params.get("scale_factor", None)
             maintain_aspect = bool(params.get("maintain_aspect", True))
-            images  = Gimp.get_images()
+            # Default to this session's own images: a shared GIMP may hold work
+            # belonging to other sessions, and resizing that would be silent damage.
+            all_images = bool(params.get("all_images", False))
+            session = self._session_id(params)
+            images = Gimp.get_images()
+            if not all_images:
+                images = [
+                    im for im in images
+                    if self._read_identity(im).get("session") == session
+                ]
+                if not images:
+                    return {
+                        "status": "error",
+                        "error": "This session has no open images to resize. Open "
+                                 "one first, or pass all_images=true to resize "
+                                 "every image open in GIMP, including other "
+                                 "sessions'.",
+                    }
             results = []
             for img in images:
                 src_w = img.get_width()
@@ -3647,13 +4033,19 @@ class MCPPlugin(Gimp.PlugIn):
             columns     = params.get("columns", None)
             padding     = int(params.get("padding", 0))
             source      = params.get("source", "layers").lower()
-            image_index = int(params.get("image_index", 0))
             import math
 
             if source == "images":
-                frames = Gimp.get_images()
+                session = self._session_id(params)
+                if bool(params.get("all_images", False)):
+                    frames = Gimp.get_images()
+                else:
+                    frames = [
+                        im for im in Gimp.get_images()
+                        if self._read_identity(im).get("session") == session
+                    ]
             else:
-                src_image = self._get_image(image_index)
+                src_image = self._resolve_image(params)
                 frames = src_image.get_layers()
 
             if not frames:
@@ -3715,7 +4107,6 @@ class MCPPlugin(Gimp.PlugIn):
         try:
             output_dir  = params.get("output_dir", "")
             platforms   = params.get("platforms", None)
-            image_index = int(params.get("image_index", 0))
 
             PLATFORM_SIZES = {
                 "instagram_square":   (1080, 1080),
@@ -3726,7 +4117,7 @@ class MCPPlugin(Gimp.PlugIn):
             }
 
             target_platforms = platforms if platforms else list(PLATFORM_SIZES.keys())
-            source_image = self._get_image(image_index)
+            source_image = self._resolve_image(params)
             os.makedirs(output_dir, exist_ok=True)
             exported = []
 
@@ -3762,61 +4153,66 @@ class MCPPlugin(Gimp.PlugIn):
     # =========================================================================
 
     def _list_images(self, params):
-        """List all open images."""
+        """List open images, flagging which belong to the calling session."""
         try:
+            session = self._session_id(params)
+            mine_only = bool(params.get("mine_only", False))
             images = Gimp.get_images()
             image_list = []
-            base_type_map = {
-                Gimp.ImageBaseType.RGB:     "RGB",
-                Gimp.ImageBaseType.GRAY:    "Grayscale",
-                Gimp.ImageBaseType.INDEXED: "Indexed",
-            }
             for i, img in enumerate(images):
                 try:
-                    gio_file = img.get_file()
-                    file_path = gio_file.get_path() if gio_file else "Untitled"
-                    image_list.append({
-                        "index":      i,
-                        "image_id":   img.get_id(),
-                        "name":       gio_file.get_basename() if gio_file else f"Untitled_{i}",
-                        "width":      img.get_width(),
-                        "height":     img.get_height(),
-                        "color_mode": base_type_map.get(img.get_base_type(), "Unknown"),
-                        "num_layers": len(img.get_layers()),
-                        "file_path":  file_path,
-                        "is_dirty":   img.is_dirty() if hasattr(img, "is_dirty") else None,
-                    })
+                    summary = self._image_summary(img, session=session, index=i)
+                    if mine_only and not summary["mine"]:
+                        continue
+                    image_list.append(summary)
                 except Exception as ex:
                     image_list.append({"index": i, "error": str(ex)})
-            return {"status": "success", "results": {"images": image_list, "count": len(image_list)}}
+            current = self._current.get(session)
+            return {
+                "status": "success",
+                "results": {
+                    "images": image_list,
+                    "count": len(image_list),
+                    "total_open": len(images),
+                    "session": session,
+                    "current": current,
+                },
+            }
         except Exception as e:
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 
     def _set_active_image(self, params):
-        """Raise a specific image to the front."""
+        """Raise an image's window and make it this session's current image."""
         try:
-            image_index = int(params.get("image_index", 0))
-            image = self._get_image(image_index)
-            displays = Gimp.get_displays()
-            for display in displays:
-                try:
-                    if display.get_image().get_id() == image.get_id():
-                        Gimp.set_default_context()
-                        display.present()
-                        break
-                except Exception:
-                    pass
+            image = self._resolve_image(params)
+            identity = self._read_identity(image)
+            display_id = self._displays.get(image.get_id())
+            presented = False
+            if display_id is not None and Gimp.Display.id_is_valid(display_id):
+                Gimp.Display.get_by_id(display_id).present()
+                presented = True
             Gimp.displays_flush()
-            return {"status": "success", "results": {"status": "success", "image_id": image.get_id()}}
+            return {
+                "status": "success",
+                "results": {
+                    "handle":   identity.get("handle"),
+                    "image_id": image.get_id(),
+                    "presented": presented,
+                    "note": None if presented else (
+                        "Image is now this session's current image, but its window "
+                        "could not be raised: no display recorded for it. Call "
+                        "reseat_displays to take ownership of existing windows."
+                    ),
+                },
+            }
         except Exception as e:
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 
     def _undo(self, params):
         """Undo N steps."""
         try:
-            image_index = int(params.get("image_index", 0))
             steps       = int(params.get("steps", 1))
-            image = self._get_image(image_index)
+            image = self._resolve_image(params)
             done = 0
             for _ in range(steps):
                 if image.undo():
@@ -3831,9 +4227,8 @@ class MCPPlugin(Gimp.PlugIn):
     def _redo(self, params):
         """Redo N steps."""
         try:
-            image_index = int(params.get("image_index", 0))
             steps       = int(params.get("steps", 1))
-            image = self._get_image(image_index)
+            image = self._resolve_image(params)
             done = 0
             for _ in range(steps):
                 if image.redo():
@@ -3848,10 +4243,9 @@ class MCPPlugin(Gimp.PlugIn):
     def _convert_color_mode(self, params):
         """Convert image color mode."""
         try:
-            image_index = int(params.get("image_index", 0))
             mode        = params.get("mode", "RGB").upper()
             num_colors  = int(params.get("num_colors", 256))
-            image = self._get_image(image_index)
+            image = self._resolve_image(params)
             image.undo_group_start()
             try:
                 if mode in ("RGB", "RGBA"):
@@ -3886,9 +4280,12 @@ class MCPPlugin(Gimp.PlugIn):
         """Close an image, optionally saving first."""
         try:
             from gi.repository import Gio
-            image_index = int(params.get("image_index", 0))
             save_first  = bool(params.get("save_first", False))
-            image = self._get_image(image_index)
+            force       = bool(params.get("force", False))
+            image = self._resolve_image(params)
+            identity = self._read_identity(image)
+            image_id = image.get_id()
+            xcf_path = None
             if save_first:
                 img_file = image.get_file()
                 if img_file:
@@ -3904,22 +4301,139 @@ class MCPPlugin(Gimp.PlugIn):
                     cfg.set_property("image", image)
                     cfg.set_property("file", gio_file)
                     proc.run(cfg)
-            # Delete all displays for this image
-            for display in Gimp.get_displays():
+            method = self._delete_image(image, force=force)
+            return {
+                "status": "success",
+                "results": {
+                    "closed": True,
+                    "handle": identity.get("handle"),
+                    "image_id": image_id,
+                    "method": method,
+                    "saved_to": xcf_path if save_first else None,
+                    "remaining_open": len(Gimp.get_images()),
+                },
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
+    def _session_info(self, params):
+        """What this session owns, what else is open, and what it will act on."""
+        try:
+            session = self._session_id(params)
+            images = Gimp.get_images()
+            mine, others = [], []
+            for image in images:
+                summary = self._image_summary(image, session=session)
+                (mine if summary["mine"] else others).append(summary)
+            current = self._current.get(session)
+            return {
+                "status": "success",
+                "results": {
+                    "session": session,
+                    "current": current,
+                    "my_images": mine,
+                    "my_count": len(mine),
+                    "other_images": others,
+                    "other_count": len(others),
+                    "total_open": len(images),
+                    "tracked_displays": len(self._displays),
+                },
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
+    def _close_my_images(self, params):
+        """Close every image this session opened, leaving other sessions alone."""
+        try:
+            session = self._session_id(params)
+            force = bool(params.get("force", False))
+            closed, failed = [], []
+            for image in list(Gimp.get_images()):
+                identity = self._read_identity(image)
+                if identity.get("session") != session:
+                    continue
+                entry = {
+                    "handle": identity.get("handle"),
+                    "image_id": image.get_id(),
+                }
                 try:
-                    if display.get_image().get_id() == image.get_id():
-                        Gimp.Display.delete(display)
-                except Exception:
-                    pass
-            image.delete()
-            return {"status": "success", "results": {"status": "success"}}
+                    entry["method"] = self._delete_image(image, force=force)
+                    closed.append(entry)
+                except Exception as ex:
+                    entry["error"] = str(ex)
+                    failed.append(entry)
+            return {
+                "status": "success",
+                "results": {
+                    "session": session,
+                    "closed": closed,
+                    "closed_count": len(closed),
+                    "failed": failed,
+                    "failed_count": len(failed),
+                    "remaining_open": len(Gimp.get_images()),
+                },
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
+    def _reseat_displays_cmd(self, params):
+        """Take ownership of windows this server did not open, so they can close."""
+        try:
+            session = self._session_id(params)
+            before = len(self._displays)
+            fresh = self._reseat_displays()
+            return {
+                "status": "success",
+                "results": {
+                    "tracked_before": before,
+                    "tracked_after": len(fresh),
+                    "images": [
+                        self._image_summary(im, session=session)
+                        for im in Gimp.get_images()
+                    ],
+                    "note": "Every open image now has a display this server can "
+                            "close. Window position and zoom were reset.",
+                },
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
+    def _adopt_image(self, params):
+        """Claim an untracked image (opened by hand in GIMP) for this session."""
+        try:
+            session = self._session_id(params)
+            image = self._resolve_image(params)
+            identity = self._read_identity(image)
+            if identity and identity.get("session") == session:
+                return {
+                    "status": "success",
+                    "results": {
+                        "already_mine": True,
+                        **self._image_summary(image, session=session),
+                    },
+                }
+            label = params.get("label")
+            if not label:
+                gio_file = image.get_file()
+                label = (
+                    os.path.splitext(os.path.basename(gio_file.get_path()))[0]
+                    if gio_file else image.get_name()
+                )
+            self._register_image(image, None, session, "adopted", label=label)
+            return {
+                "status": "success",
+                "results": {
+                    "already_mine": False,
+                    **self._image_summary(image, session=session),
+                },
+            }
         except Exception as e:
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 
     def _get_selection_bounds(self, params):
         """Get selection bounding rectangle."""
         try:
-            image = self._get_image(int(params.get("image_index", 0)))
+            image = self._resolve_image(params)
             _ok, non_empty, x1, y1, x2, y2 = Gimp.Selection.bounds(image)
             return {
                 "status": "success",
@@ -3937,11 +4451,10 @@ class MCPPlugin(Gimp.PlugIn):
     def _get_pixel_color(self, params):
         """Get color of a single pixel."""
         try:
-            image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             x           = int(params.get("x", 0))
             y           = int(params.get("y", 0))
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = self._resolve_layer(image, layer_name, None)
             pixel    = drawable.get_pixel(x, y)
             # GIMP 3.2: get_pixel returns a Gegl.Color object
@@ -3977,9 +4490,8 @@ class MCPPlugin(Gimp.PlugIn):
                 "blue":  Gimp.HistogramChannel.BLUE,
                 "alpha": Gimp.HistogramChannel.ALPHA,
             }
-            image_index = int(params.get("image_index", 0))
             channel_str = params.get("channel", "value")
-            image    = self._get_image(image_index)
+            image    = self._resolve_image(params)
             drawable = (image.get_selected_layers() or image.get_layers() or [None])[0]
             channel  = CHANNEL_MAP.get(channel_str.lower(), Gimp.HistogramChannel.VALUE)
             pdb = Gimp.get_pdb()
