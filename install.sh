@@ -38,10 +38,16 @@ set -euo pipefail
 #   GIMP_MCP_REPO_RAW=https://raw.githubusercontent.com/you/gimp-mcp/dev
 REPO_RAW="${GIMP_MCP_REPO_RAW:-https://raw.githubusercontent.com/tschallacka/gimp-mcp/main}"
 PLUGIN_FILE="gimp-mcp-plugin.py"
+SERVER_FILE="gimp_mcp_server.py"
+REGISTER_FILE="tools/register_mcp.py"
+# The MCP server is a script an agent launches, so it needs a home that is not
+# a git checkout the user might move or delete.
+SERVER_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/gimp-mcp"
 PLUGIN_DIR_NAME="gimp-mcp-plugin"
 CONFIG_NAME="mcp-server.json"
 
 AUTOSTART=""
+REGISTER=""
 ASSUME_YES=0
 UNINSTALL=0
 SOURCE_DIR=""
@@ -60,6 +66,7 @@ Finds every GIMP 3.x user config directory on this machine, installs the MCP
 plugin into each, and offers to start the MCP server automatically with GIMP.
 
   --autostart / --no-autostart   set startup behaviour without being asked
+  --register / --no-register     add the MCP server to your coding agents
   --yes                          accept defaults, never prompt
   --uninstall                    remove the plugin from every config dir found
   --source DIR                   install from a local checkout instead of GitHub
@@ -98,6 +105,8 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --autostart)    AUTOSTART=true ;;
         --no-autostart) AUTOSTART=false ;;
+        --register)     REGISTER=true ;;
+        --no-register)  REGISTER=false ;;
         --yes|-y)       ASSUME_YES=1 ;;
         --uninstall)    UNINSTALL=1 ;;
         --source)
@@ -167,6 +176,23 @@ say "Found ${#GIMP_DIRS[@]} GIMP config director$([ "${#GIMP_DIRS[@]}" -eq 1 ] &
 for d in "${GIMP_DIRS[@]}"; do say "  $d"; done
 say ""
 
+# Uninstall runs before the download section, so it needs its own fetcher.
+fetch_companion_early() {
+    local rel="$1" dest="$2" src_dir=""
+    if [ -n "${BASH_SOURCE[0]:-}" ] && [ -r "${BASH_SOURCE[0]}" ]; then
+        src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    fi
+    if [ -n "$src_dir" ] && [ -f "$src_dir/$rel" ]; then
+        cp "$src_dir/$rel" "$dest"
+        return 0
+    fi
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$REPO_RAW/$rel" -o "$dest" 2>/dev/null
+    else
+        return 1
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Uninstall
 # ---------------------------------------------------------------------------
@@ -184,6 +210,14 @@ if [ "$UNINSTALL" = "1" ]; then
             ok "removed $d/$CONFIG_NAME"
         fi
     done
+    reg="$(mktemp)"
+    if fetch_companion_early "$REGISTER_FILE" "$reg"; then
+        say ""
+        say "Removing it from coding agents:"
+        python3 "$reg" --remove || true
+    fi
+    rm -f "$reg"
+    rm -rf "$SERVER_DIR"
     say ""
     say "Done. Restart GIMP to unload the plugin."
     exit 0
@@ -225,6 +259,28 @@ fi
 
 python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$SRC" \
     || die "the plugin file is not valid Python; refusing to install it"
+
+# Fetch a companion file from the same place the plugin came from.
+fetch_companion() {
+    local rel="$1" dest="$2" src_dir=""
+    if [ -n "$SOURCE_DIR" ]; then
+        src_dir="$SOURCE_DIR"
+    elif [ -n "${BASH_SOURCE[0]:-}" ] && [ -r "${BASH_SOURCE[0]}" ]; then
+        src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    fi
+
+    if [ -n "$src_dir" ] && [ -f "$src_dir/$rel" ]; then
+        cp "$src_dir/$rel" "$dest"
+        return 0
+    fi
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$REPO_RAW/$rel" -o "$dest" 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$dest" "$REPO_RAW/$rel" 2>/dev/null
+    else
+        return 1
+    fi
+}
 
 # ---------------------------------------------------------------------------
 # Pin the interpreter.
@@ -288,6 +344,15 @@ if [ -z "$AUTOSTART" ]; then
     say "have to pick Tools > MCP > Start MCP Server by hand each time."
     AUTOSTART="$(ask_yes_no "Start the MCP server automatically with GIMP?" true)"
 fi
+
+if [ -z "$REGISTER" ]; then
+    say ""
+    say "The MCP server can also be added to the coding agents on this machine"
+    say "(Claude Code, Claude Desktop, Codex, opencode, Cline), so they can drive"
+    say "GIMP without you editing each one's config by hand. Existing entries are"
+    say "left alone and every file is backed up first."
+    REGISTER="$(ask_yes_no "Add it to your coding agents?" true)"
+fi
 say ""
 
 # ---------------------------------------------------------------------------
@@ -314,6 +379,37 @@ done
 
 say ""
 say "Installed into $installed GIMP config director$([ "$installed" -eq 1 ] && echo y || echo ies)."
+
+# ---------------------------------------------------------------------------
+# The MCP server, and telling agents about it
+# ---------------------------------------------------------------------------
+SERVER_INSTALLED=""
+if [ "$REGISTER" = "true" ]; then
+    say ""
+    mkdir -p "$SERVER_DIR"
+    if fetch_companion "$SERVER_FILE" "$SERVER_DIR/$SERVER_FILE" \
+        && python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" \
+            "$SERVER_DIR/$SERVER_FILE" 2>/dev/null; then
+        SERVER_INSTALLED="$SERVER_DIR/$SERVER_FILE"
+        ok "MCP server at $SERVER_INSTALLED"
+    else
+        warn "could not fetch $SERVER_FILE; skipping agent registration"
+    fi
+
+    if [ -n "$SERVER_INSTALLED" ]; then
+        reg="$TMPDIR_INST/register_mcp.py"
+        if fetch_companion "$REGISTER_FILE" "$reg"; then
+            say ""
+            say "Registering with coding agents:"
+            python3 "$reg" --server "$SERVER_INSTALLED" || \
+                warn "registration reported problems; see above"
+        else
+            warn "could not fetch $REGISTER_FILE; register by hand with:"
+            warn "  claude mcp add gimp -- uv run --with mcp --with fastmcp \\"
+            warn "      python3 $SERVER_INSTALLED"
+        fi
+    fi
+fi
 say ""
 if [ "$AUTOSTART" = "true" ]; then
     say "Next: restart GIMP. The MCP server will come up on port $PORT by itself."
@@ -322,9 +418,14 @@ else
     say "To change your mind later: Tools > MCP > Toggle MCP Autostart."
 fi
 say ""
-say "Then point your MCP client at the server, for example:"
-say ""
-say "  claude mcp add gimp -- uv run --directory /path/to/gimp-mcp gimp_mcp_server.py"
+if [ -n "$SERVER_INSTALLED" ]; then
+    say "Your agents have been told about the server. Restart them to pick it up."
+else
+    say "Then point your MCP client at the server, for example:"
+    say ""
+    say "  claude mcp add gimp -- uv run --with mcp --with fastmcp \\"
+    say "      python3 /path/to/gimp_mcp_server.py"
+fi
 say ""
 say "Verify with the check_server tool, or:"
 say "  python3 -c \"import socket;s=socket.create_connection(('localhost',$PORT),3);print('MCP server is up')\""

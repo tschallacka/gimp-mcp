@@ -117,8 +117,9 @@ writes it into the shebang as an absolute path. Override the choice with
 | Flag | Effect |
 |---|---|
 | `--autostart` / `--no-autostart` | Set the startup behaviour without being asked |
+| `--register` / `--no-register` | Add the MCP server to the coding agents on this machine |
 | `--yes` | Accept defaults, never prompt (for scripts and CI) |
-| `--uninstall` | Remove the plugin from every config directory found |
+| `--uninstall` | Remove the plugin, its config, the server, and every agent entry |
 | `--source DIR` | Install from a local checkout instead of GitHub |
 | `--port N` | Use a different socket port (default 9877) |
 
@@ -814,6 +815,42 @@ To bump the pinned hook versions later:
 ```bash
 uv run pre-commit autoupdate
 ```
+
+## Telling your agent about the server
+
+Installing the GIMP plug-in is only half the job: the agent still has to know
+the MCP server exists. The installer offers to do that for whichever of these
+it finds on the machine:
+
+| Agent | Config it writes |
+|---|---|
+| Claude Code | `claude mcp add`, or `~/.claude.json` if the CLI is absent |
+| Claude Desktop | `claude_desktop_config.json` |
+| Codex | `~/.codex/config.toml` |
+| opencode | `~/.config/opencode/opencode.json` |
+| Cline | `cline_mcp_settings.json` |
+
+The server itself is installed to `~/.local/share/gimp-mcp/`, outside any git
+checkout, so moving or deleting the repository does not break the agents.
+
+Existing entries are left alone and every file is backed up before it is
+touched; a config that is not valid JSON is reported and skipped rather than
+overwritten. Running it again is a no-op when the entry is already correct.
+
+Do it separately, or check first what would be written:
+
+```bash
+python3 tools/register_mcp.py --list                 # what was detected
+python3 tools/register_mcp.py --server ~/.local/share/gimp-mcp/gimp_mcp_server.py
+python3 tools/register_mcp.py --remove               # take it back out
+```
+
+Where `uv` is available the entry runs the server with `uv run --with mcp
+--with fastmcp`, so the dependencies resolve per-run and nothing has to be
+installed globally. Without `uv` it uses plain `python3` and tells you to
+`pip install mcp fastmcp`.
+
+Restart the agent afterwards; none of them re-read their MCP config live.
 
 ## Full tool reference
 
