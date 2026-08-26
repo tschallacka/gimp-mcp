@@ -94,7 +94,7 @@ The AI removes the background, takes a snapshot to inspect the result, detects r
 Launch GIMP once so it creates its config folder, quit it, then run:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/maorcc/gimp-mcp/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/tschallacka/gimp-mcp/main/install.sh | bash
 ```
 
 The installer finds every GIMP 3.x user config directory on the machine — native,
@@ -125,7 +125,7 @@ writes it into the shebang as an absolute path. Override the choice with
 From a clone, install the working copy rather than the published one:
 
 ```bash
-git clone https://github.com/maorcc/gimp-mcp.git
+git clone https://github.com/tschallacka/gimp-mcp.git
 cd gimp-mcp
 ./install.sh --source .
 ```
@@ -172,7 +172,7 @@ To change your mind later, use **Tools > MCP > Toggle MCP Autostart**, or edit
 ### 3. Install the server dependencies
 
 ```bash
-git clone https://github.com/maorcc/gimp-mcp.git
+git clone https://github.com/tschallacka/gimp-mcp.git
 cd gimp-mcp
 uv sync
 ```

@@ -26,7 +26,7 @@ offers to start the server automatically with GIMP:
 ```bash
 ./install.sh --source .     # from a clone
 # or, for end users:
-curl -fsSL https://raw.githubusercontent.com/maorcc/gimp-mcp/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/tschallacka/gimp-mcp/main/install.sh | bash
 ```
 
 Flags: `--autostart` / `--no-autostart`, `--yes`, `--uninstall`, `--source DIR`, `--port N`.

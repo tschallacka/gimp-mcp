@@ -2,7 +2,7 @@
 #
 # GIMP MCP installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/maorcc/gimp-mcp/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/tschallacka/gimp-mcp/main/install.sh | bash
 #
 # Finds every GIMP 3.x user config directory on this machine, installs the MCP
 # plugin into it, and offers to start the server automatically with GIMP.
@@ -16,7 +16,10 @@
 
 set -euo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/maorcc/gimp-mcp/main"
+# Where the installer fetches the plugin when it is not run from a
+# checkout. Point it elsewhere with GIMP_MCP_REPO_RAW, e.g. at a branch:
+#   GIMP_MCP_REPO_RAW=https://raw.githubusercontent.com/you/gimp-mcp/dev
+REPO_RAW="${GIMP_MCP_REPO_RAW:-https://raw.githubusercontent.com/tschallacka/gimp-mcp/main}"
 PLUGIN_FILE="gimp-mcp-plugin.py"
 PLUGIN_DIR_NAME="gimp-mcp-plugin"
 CONFIG_NAME="mcp-server.json"
@@ -34,7 +37,7 @@ usage() {
     cat <<'USAGE'
 GIMP MCP installer
 
-  curl -fsSL https://raw.githubusercontent.com/maorcc/gimp-mcp/main/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/tschallacka/gimp-mcp/main/install.sh | bash
 
 Finds every GIMP 3.x user config directory on this machine, installs the MCP
 plugin into each, and offers to start the MCP server automatically with GIMP.
