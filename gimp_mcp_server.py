@@ -34,6 +34,11 @@ DEFAULT_SESSION_NAME = "MCP client"
 SESSION_NAME = os.environ.get("GIMP_MCP_SESSION_NAME") or DEFAULT_SESSION_NAME
 
 
+# Notifications that arrived on a response with nowhere to put them. Drained
+# by get_notifications() so they are reported rather than lost.
+_PENDING_NOTIFICATIONS: list = []
+
+
 def session_identity() -> dict:
     """Who this session is, in terms a person can act on."""
     try:
@@ -48,18 +53,27 @@ def session_identity() -> dict:
         "_session_pid": os.getpid(),
     }
 
+# Most commands answer immediately. request_elevation does not: it blocks in
+# the plugin until a human clicks the approval dialog, so it needs a timeout in
+# the same order as the plugin's own ELEVATION_PROMPT_TIMEOUT (180s) plus room
+# to answer. With the default the client hung up at 10s while the grant went
+# through anyway -- the tool reported failure for an access it had been given.
+DEFAULT_TIMEOUT = 30
+COMMAND_TIMEOUTS = {"request_elevation": 200}
+
+
 class GimpConnection:
     def __init__(self, host=GIMP_HOST, port=GIMP_PORT):
         self.host = host
         self.port = port
         self.sock = None
 
-    def connect(self):
+    def connect(self, timeout=DEFAULT_TIMEOUT):
         if self.sock:
             return
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(10)
+            self.sock.settimeout(timeout)
             self.sock.connect((self.host, self.port))
             logger.info(f"Connected to GIMP at {self.host}:{self.port}")
         except Exception as e:
@@ -75,9 +89,13 @@ class GimpConnection:
                 pass
             self.sock = None
 
-    def send_command(self, command_type, params=None):
+    def send_command(self, command_type, params=None, timeout=None):
+        if timeout is None:
+            timeout = COMMAND_TIMEOUTS.get(command_type, DEFAULT_TIMEOUT)
         if not self.sock:
-            self.connect()
+            self.connect(timeout)
+        else:
+            self.sock.settimeout(timeout)
         params = dict(params) if params else {"args": []}
         for key, value in session_identity().items():
             params.setdefault(key, value)
@@ -97,14 +115,18 @@ class GimpConnection:
                     continue
             parsed = json.loads(response_data.decode('utf-8'))
             # The plugin cannot push to us, so anything queued for this session
-            # arrives attached to whatever response comes next. Hoist it into
-            # the results so the caller actually sees it.
+            # arrives attached to whatever response comes next -- and the plugin
+            # has already dropped it from its queue by then. Buffer it locally so
+            # a response whose `results` is a list (exec) or missing (an error)
+            # cannot swallow the only copy.
             notes = parsed.get("notifications")
             if notes:
                 logger.info("GIMP notifications: %s", notes)
                 results = parsed.get("results")
                 if isinstance(results, dict):
                     results["notifications"] = notes
+                else:
+                    _PENDING_NOTIFICATIONS.extend(notes)
             return parsed
         except Exception as e:
             logger.error(f"Communication error: {e}")
@@ -2600,14 +2622,20 @@ def batch_resize(
     width: int | None = None,
     height: int | None = None,
     scale_factor: float | None = None,
-    maintain_aspect: bool = True
+    maintain_aspect: bool = True,
+    all_images: bool = False
 ) -> dict:
-    """Resize all open images to a common target size.
+    """Resize every image this session has open, to a common target size.
+
+    Scoped to your own images by default. One GIMP can be shared by several
+    sessions, and resizing another session's work is not recoverable.
 
     Parameters:
     - width / height: Target dimensions in pixels (provide one or both)
     - scale_factor: Proportional scale (e.g. 0.5 = 50%); overrides width/height if set
     - maintain_aspect: Preserve aspect ratio when only one dimension is given (default True)
+    - all_images: Also resize images belonging to other sessions and images
+      opened by hand in GIMP. Rarely what you want; check list_images() first.
 
     Returns: {results: [{image_id, old_width, old_height, new_width, new_height}], count}
     """
@@ -2616,6 +2644,7 @@ def batch_resize(
         result = conn.send_command("batch_resize", {
             "width": width, "height": height,
             "scale_factor": scale_factor, "maintain_aspect": maintain_aspect,
+            "all_images": all_images,
         })
         if result["status"] == "success":
             return result["results"]
@@ -2632,7 +2661,8 @@ def export_sprite_sheet(
     columns: int | None = None,
     padding: int = 0,
     source: str = "layers",
-    image: str | int | None = None
+    image: str | int | None = None,
+    all_images: bool = False
 ) -> dict:
     """Combine multiple frames into a sprite sheet PNG.
 
@@ -2640,7 +2670,10 @@ def export_sprite_sheet(
     - output_path: Absolute path for the output PNG file
     - columns: Number of columns in the grid (defaults to square root of frame count)
     - padding: Pixel gap between frames (default 0)
-    - source: "layers" (each layer is a frame; default) or "images" (each open image)
+    - source: "layers" (each layer is a frame; default) or "images", which uses
+      this session's open images as frames
+    - all_images: With source="images", also include images belonging to other
+      sessions. Rarely what you want in a shared GIMP.
     - image: Which image to act on. Accepts the handle returned by new_canvas/open_image,
           a GIMP image_id, a file path, or a label. Omit it to use this session's
           current image (the last one you touched).
@@ -2652,6 +2685,7 @@ def export_sprite_sheet(
         result = conn.send_command("export_sprite_sheet", {
             "output_path": output_path, "columns": columns,
             "padding": padding, "source": source, "image": image,
+            "all_images": all_images,
         })
         if result["status"] == "success":
             return result["results"]
@@ -2957,9 +2991,18 @@ def get_notifications(ctx: Context) -> dict:
     try:
         conn = get_gimp_connection()
         result = conn.send_command("get_notifications", {})
-        if result["status"] == "success":
-            return result["results"]
-        raise Exception(result.get("error", "Unknown error"))
+        if result["status"] != "success":
+            raise Exception(result.get("error", "Unknown error"))
+        results = result["results"]
+        if _PENDING_NOTIFICATIONS:
+            # Anything the plugin handed us on a response that could not carry
+            # it. Prepend: these arrived first.
+            results["notifications"] = (
+                _PENDING_NOTIFICATIONS + results.get("notifications", [])
+            )
+            results["count"] = len(results["notifications"])
+            _PENDING_NOTIFICATIONS.clear()
+        return results
     except Exception as e:
         traceback.print_exc()
         raise Exception(f"get_notifications failed: {e}")

@@ -73,6 +73,9 @@ class FakeImage:
     def get_base_type(self):
         return "RGB"
 
+    def scale(self, w, h):
+        self._w, self._h = w, h
+
     def get_layers(self):
         return []
 
@@ -157,9 +160,15 @@ class FakeGimp:
     def message(_m):
         pass
 
+    file_load_result = None
+
     @staticmethod
     def get_pdb():
         return None
+
+    @staticmethod
+    def file_load(_run_mode, _gio_file):
+        return FakeGimp.file_load_result
 
     @staticmethod
     def main(*_a, **_k):
@@ -230,11 +239,17 @@ def new_plugin():
 
 
 def open_canvas(plugin, session, label, path=None):
-    """Mimic what _new_canvas/_open_image do: make an image, display, identity."""
+    """Mimic what _new_canvas/_open_image do: make an image, display, identity.
+
+    Also marks the session as just-seen, which _handle_client does for every
+    real request. Without it the owner looks like a session that has gone away
+    and its images become adoptable.
+    """
     image = FakeImage(name=label, path=path)
     FakeGimp.images.append(image)
     display = FakeDisplay.new(image)
     identity = plugin._register_image(image, display, session, "new_canvas", label)
+    plugin._last_seen[session] = MODULE.time.time()
     return image, identity
 
 
@@ -620,6 +635,164 @@ class TestAdminClose(RegistryTest):
         self.assertEqual(result["closed_count"], 1)
         remaining = [i.get_name() for i in FakeGimp.get_images()]
         self.assertEqual(remaining, ["theirs"])
+
+
+class TestReviewFindings(RegistryTest):
+    """Regression pins for defects an adversarial review found.
+
+    Each of these passed review only after a fix; they exist so the fix cannot
+    quietly come back out.
+    """
+
+    # -- F2: reseat must never destroy an image ---------------------------
+    def test_reseat_rolls_back_rather_than_destroying_an_image(self):
+        keep, _ = open_canvas(self.plugin, "s1", "keepme")
+        other, _ = open_canvas(self.plugin, "s1", "other")
+
+        real_new = FakeDisplay.new
+
+        def flaky(image):
+            if image is keep:
+                raise RuntimeError("Gimp.Display.new returned NULL")
+            return real_new(image)
+
+        FakeDisplay.new = staticmethod(flaky)
+        try:
+            with self.assertRaises(RuntimeError) as caught:
+                self.plugin._reseat_displays()
+        finally:
+            FakeDisplay.new = staticmethod(real_new)
+
+        self.assertIn("nothing was reseated", str(caught.exception))
+        # Both images must still be open: losing unsaved work is the worst case.
+        self.assertEqual(set(FakeGimp.get_images()), {keep, other})
+
+    # -- F3: the no-argument path must respect ownership ------------------
+    def test_lone_image_of_a_live_session_is_not_borrowed(self):
+        open_canvas(self.plugin, "other", "theirs")
+        with self.assertRaises(RuntimeError) as caught:
+            self.plugin._resolve_image({"_session": "mine"})
+        self.assertIn("belongs to another session", str(caught.exception))
+
+    def test_revoking_elevation_drops_the_remembered_image(self):
+        open_canvas(self.plugin, "other", "theirs")
+        self.plugin._elevated["mine"] = {"granted_at": 0, "reason": "x"}
+        self.plugin._resolve_image({"image": "theirs", "_session": "mine"})
+        self.assertEqual(self.plugin._current["mine"], 1)
+
+        self.plugin._revoke_elevation({"_session": "mine"})
+        with self.assertRaises(RuntimeError):
+            self.plugin._resolve_image({"_session": "mine"})
+
+    # -- F4: a restarted client must not be locked out --------------------
+    def test_images_of_a_vanished_session_are_reclaimable(self):
+        open_canvas(self.plugin, "old-session", "work")
+        # The client restarted: the old id never speaks again.
+        self.plugin._last_seen["old-session"] = MODULE.time.time() - 99999
+        resolved = self.plugin._resolve_image({"image": "work", "_session": "new"})
+        self.assertEqual(resolved.get_name(), "work")
+
+    def test_a_live_session_is_still_protected(self):
+        open_canvas(self.plugin, "live", "work")
+        with self.assertRaises(RuntimeError):
+            self.plugin._resolve_image({"image": "work", "_session": "new"})
+
+    # -- F5: bulk operations need the same permission ---------------------
+    def test_batch_resize_all_images_needs_elevation(self):
+        open_canvas(self.plugin, "mine", "ours")
+        open_canvas(self.plugin, "other", "theirs")
+        result = self.plugin._batch_resize({
+            "_session": "mine", "width": 10, "height": 10,
+            "output_dir": "/tmp", "all_images": True,
+        })
+        self.assertEqual(result["status"], "error")
+        self.assertIn("administrator access", result["error"])
+
+    def test_batch_resize_all_images_allowed_once_elevated(self):
+        open_canvas(self.plugin, "mine", "ours")
+        open_canvas(self.plugin, "other", "theirs")
+        self.plugin._elevated["mine"] = {"granted_at": 0, "reason": "x"}
+        result = self.plugin._batch_resize({
+            "_session": "mine", "scale_factor": 0.5, "all_images": True,
+        })
+        self.assertEqual(result["status"], "success", result)
+        # Elevation means it really does reach the other session's image.
+        self.assertEqual(result["results"]["count"], 2)
+
+    def test_sprite_sheet_all_images_needs_elevation(self):
+        open_canvas(self.plugin, "mine", "ours")
+        result = self.plugin._export_sprite_sheet({
+            "_session": "mine", "source": "images",
+            "output_path": "/tmp/s.png", "all_images": True,
+        })
+        self.assertEqual(result["status"], "error")
+        self.assertIn("administrator access", result["error"])
+
+    # -- F12: batch_export defaults to this session's images --------------
+    def test_batch_export_defaults_to_mine_only(self):
+        open_canvas(self.plugin, "mine", "ours")
+        open_canvas(self.plugin, "other", "theirs")
+        result = self.plugin._batch_export(
+            {"_session": "mine", "output_dir": "/tmp"}
+        )
+        # Whether the export succeeds against stubs does not matter; the target
+        # set does. Exactly one image should have been attempted.
+        r = result["results"]
+        attempted = len(r.get("exported", [])) + len(r.get("errors", []))
+        self.assertEqual(attempted, 1, r)
+
+    def test_batch_export_all_images_needs_elevation(self):
+        open_canvas(self.plugin, "mine", "ours")
+        open_canvas(self.plugin, "other", "theirs")
+        result = self.plugin._batch_export({
+            "_session": "mine", "output_dir": "/tmp", "mine_only": False,
+        })
+        self.assertEqual(result["status"], "error")
+        self.assertIn("administrator access", result["error"])
+
+    # -- F11: taking a live session's image is an accountable act ---------
+    def test_adopting_a_live_sessions_image_needs_a_reason(self):
+        open_canvas(self.plugin, "owner", "theirs")
+        self.plugin._elevated["admin"] = {"granted_at": 0, "reason": "x"}
+        result = self.plugin._adopt_image(
+            {"image": "theirs", "_session": "admin"}
+        )
+        self.assertEqual(result["status"], "error")
+        self.assertIn("reason", result["error"])
+
+    def test_adopting_a_live_sessions_image_notifies_them(self):
+        open_canvas(self.plugin, "owner", "theirs")
+        self.plugin._elevated["admin"] = {"granted_at": 0, "reason": "x"}
+        result = self.plugin._adopt_image({
+            "image": "theirs", "_session": "admin", "reason": "taking over",
+        })
+        self.assertEqual(result["status"], "success", result)
+        pending = self.plugin._get_notifications({"_session": "owner"})["results"]
+        self.assertEqual(pending["count"], 1)
+        self.assertEqual(
+            pending["notifications"][0]["type"], "image_adopted_by_administrator"
+        )
+
+    def test_adopting_an_abandoned_image_needs_nothing(self):
+        open_canvas(self.plugin, "ghost", "theirs")
+        self.plugin._last_seen["ghost"] = MODULE.time.time() - 99999
+        result = self.plugin._adopt_image(
+            {"image": "theirs", "_session": "mine"}
+        )
+        self.assertEqual(result["status"], "success", result)
+        self.assertTrue(result["results"]["mine"])
+
+    # -- F9: a failed delivery must not lose the notification -------------
+    def test_requeued_notification_is_not_lost(self):
+        self.plugin._last_seen["owner"] = MODULE.time.time()
+        self.plugin._notify("owner", {"type": "x", "message": "one"})
+        taken = self.plugin._take_notifications("owner")
+        self.assertEqual(len(taken), 1)
+        for note in reversed(taken):
+            self.plugin._requeue_notification("owner", note)
+        again = self.plugin._get_notifications({"_session": "owner"})["results"]
+        self.assertEqual(again["count"], 1)
+        self.assertEqual(again["notifications"][0]["message"], "one")
 
 
 class TestSessionInfo(RegistryTest):

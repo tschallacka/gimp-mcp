@@ -1,20 +1,139 @@
-# GIMP PyGObject via MCP Documentation
+# GIMP MCP Protocol Documentation
 
 ## Overview
-This document describes how to execute PyGObject commands in GIMP using the MCP (Model Context Protocol) interface. The GIMP MCP server provides multiple tools for interacting with GIMP 3.0, including image export capabilities that return MCP-compliant Image objects.
+This document describes the wire protocol between `gimp_mcp_server.py` and the GIMP
+plugin, and how to execute raw PyGObject commands through it. The server exposes 90
+named tools plus `call_api` for arbitrary Python-Fu.
+
+Tested against GIMP 3.2; most of the API notes below apply to 3.0 as well.
+
+## Wire Protocol
+
+Two message shapes travel over the TCP socket on `localhost:9877`:
+
+```json
+{"type": "<command>", "params": { ... }}      // a named tool
+{"cmds": ["python...", "python..."]}          // arbitrary exec
+```
+
+### Session identity
+
+Every request carries a `_session` key in `params`, minted once per MCP server
+process, alongside the client's name, working directory, host and pid. The plugin
+records who owns each image, and uses the description when it has to ask the user
+about a session.
+
+```json
+{"type": "new_canvas",
+ "params": {"width": 512, "height": 512,
+            "_session": "mcp-1234-ab12cd34",
+            "_client": "icon export for acme-web",
+            "_cwd": "/home/u/acme-web", "_host": "workstation", "_pid": 1234}}
+```
+
+The client name comes from `set_session_name`, else `$GIMP_MCP_SESSION_NAME`, else a
+generic default.
+
+### Ownership is enforced
+
+One GIMP can serve several sessions at once. Naming an image owned by a different
+session — by handle, id or path — is **refused**:
+
+```
+Image 'x' belongs to another MCP session (...) and this session is not an
+administrator. Ask the user for administrator access with request_elevation(reason=...)
+```
+
+Untracked images, ones the user opened by hand in GIMP, have no owner and stay
+reachable by every session.
+
+### Administrator elevation
+
+`request_elevation` puts a GTK dialog in GIMP and blocks until the user answers
+(180s timeout); `reason` is required and shown verbatim. While elevated, a session
+resolves every session's images. `elevation_status` and `revoke_elevation` complete
+the set, and the user can revoke all grants from
+**Tools > MCP > Revoke MCP Admin Access**.
+
+### Notifications
+
+There is no server push on this socket. Messages for a session are queued and ride
+along on that session's **next** response, under a `notifications` key in the result
+object; `get_notifications` drains the queue explicitly. Closing another session's
+image requires `reason=...` and notifies the owner:
+
+```json
+{"type": "image_closed_by_administrator", "message": "...", "handle": "stale-canvas",
+ "image_id": 7, "label": "stale canvas", "closed_by": "mcp-...", "reason": "...",
+ "saved_to": null, "at": 1730000000.0}
+```
+
+Each notification is delivered once. Queues for sessions quiet more than an hour are
+dropped.
+
+### Checkpoints
+
+GIMP 3.x exposes no undo to plug-ins — no `gimp-image-undo` in the PDB, only undo
+*groups* on `Gimp.Image` — so `undo` and `redo` always return an error saying so.
+`checkpoint` writes an XCF snapshot and `restore_checkpoint` loads it back in place of
+the current image, keeping the same handle while the `image_id` changes.
+
+### Path validation
+
+Empty `file_path`, `output_dir` and `output_path` values are rejected by the plugin.
+Passing an empty path through to GIMP raises a modal dialog inside the user's GIMP that
+the calling session never sees.
+
+### Addressing an image
+
+Commands that act on an image take an `image` key. There is no `image_index` — a
+positional index drifts as GIMP's image list reorders, silently retargeting edits.
+
+`image` accepts, in resolution order:
+
+1. a **handle** — the short readable id returned by `new_canvas` / `open_image`
+   (preferring one owned by the calling session)
+2. a **GIMP image_id**, as int or numeric string
+3. a **file path**, exact
+4. a **file base name**
+5. a **label**, then the GIMP image name
+
+Omit `image` and the plugin uses the session's current image — the last one it
+touched. With no current image and several images owned by others, it errors.
+
+```json
+{"type": "sharpen", "params": {"image": "cat.png", "amount": 40, "_session": "mcp-1234-ab12cd34"}}
+```
+
+### Image identity storage
+
+Identity lives on the image itself, as a GIMP parasite named `gimp-mcp` holding
+`{handle, session, label, origin, created}`. Parasites travel with the image and
+survive a plugin restart.
+
+```python
+import json
+p = Gimp.Parasite.new("gimp-mcp", 1, json.dumps({"handle": "cat"}).encode())
+image.attach_parasite(p)
+data = json.loads(bytes(image.get_parasite("gimp-mcp").get_data()).decode())
+```
 
 ## Available MCP Tools
 
 ### 1. Image Export Tools
 
-#### `get_image_bitmap()` 
-Returns the current open image as an MCP-compliant Image object in PNG format.
+#### `get_image_bitmap()`
+Returns an open image as an MCP-compliant Image object in PNG format.
 - **Returns**: Image object that Claude can directly process
 - **Format**: PNG
 - **MCP Compliant**: Yes - returns proper ImageContent structure
+- **Image selection**: takes an `image` argument like every other tool
+  (handle, image_id, file path, or label). Omit it for the session's current
+  image.
 
-#### `get_image_metadata()` 
-Returns comprehensive metadata about the current open image without transferring bitmap data.
+#### `get_image_metadata()`
+Returns comprehensive metadata about an open image without transferring bitmap data.
+Takes the same `image` argument as every other tool.
 - **Returns**: Dictionary containing detailed image information
 - **Performance**: Much faster than `get_image_bitmap()` - no image export required
 - **Use case**: Perfect for analysis, decision making, and information gathering
@@ -200,7 +319,18 @@ Gimp.displays_flush()
   white_color = Gegl.Color.new('white')
   Gimp.context_set_background(white_color)
   Gimp.Drawable.edit_fill(drawable, Gimp.FillType.BACKGROUND)
-  Gimp.Display.new(image)
+  display = Gimp.Display.new(image)   # keep display.get_id() if you want to close it later
+  ```
+
+  Prefer the `new_canvas` tool over this: it registers a handle and records the
+  display, so the image can be addressed and closed afterwards. An image created
+  through raw `call_api` is untracked and needs `adopt_image` / `reseat_displays`.
+
+- **Close an image**:
+  ```python
+  # Deleting the last display of an image closes the image.
+  Gimp.Display.get_by_id(display_id).delete()
+  Gimp.displays_flush()
   ```
 
 ### Important Tips
@@ -211,7 +341,11 @@ Gimp.displays_flush()
 - After selection operations for drawing, unselect with `Gimp.Selection.none(image)`
 - Use `from gi.repository import Gio` for file operations: `Gio.File.new_for_path(path)`
 
-### Non-Working Methods (GIMP 3.0 Changes)
+### Non-Working Methods (GIMP 3.x Changes)
+- **`Gimp.get_displays()`**: ❌ Does not exist. There is no way to enumerate displays or
+  to ask which image a display shows. Only `Gimp.Display.new()`, `get_by_id()`,
+  `id_is_valid()`, `present()` and `delete()` exist. Record the display id when you
+  create the window; deleting an image's last display closes the image.
 - **`Gimp.get_active_image()`**: ❌ Does not exist
 - **`Gimp.list_images()`**: ❌ Does not exist  
 - **`Gimp.get_active_layer()`**: ❌ Does not exist (use `image.get_active_layer()` instead)
@@ -278,6 +412,7 @@ The GIMP MCP server now provides dedicated tools for image export that return MC
 ```python
 # This returns an Image object that Claude can directly process
 image = get_image_bitmap()
+```
 
 **Purpose:** Get the current image as a base64-encoded PNG bitmap with support for region extraction and scaling
 
@@ -462,6 +597,15 @@ gimp_info = get_gimp_info()
 2. **`"disable_auto_disconnect"`**: Keep connection alive
 3. **JSON with `"cmds"`**: Execute command array  
 4. **JSON with `"params"`**: Structured API calls
+
+Session and image-management commands: `session_info`, `list_images`,
+`close_my_images`, `adopt_image`, `reseat_displays`, `set_active_image`,
+`close_image`.
+
+Identity, approval and messaging: `set_session_name`, `request_elevation`,
+`elevation_status`, `revoke_elevation`, `get_notifications`.
+
+Checkpoints: `checkpoint`, `restore_checkpoint`.
 
 ### Error Handling
 - Multiple export fallback methods

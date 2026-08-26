@@ -1,5 +1,95 @@
 # GIMP MCP Best Practices & Recipes
 
+## ✅ ADDRESSING IMAGES - Handles, Not Positions
+
+**DO: Keep the handle and pass it explicitly**
+```python
+handle = open_image("/photos/cat.png")["handle"]   # -> "cat"
+sharpen(amount=40, image=handle)
+export_image("/tmp/out.png", image=handle)
+close_my_images()                                  # clean up what you opened
+```
+
+`image` also accepts the file path, its base name, or the GIMP image_id. Omit it
+entirely and the tool uses the session's current image — the last one you touched.
+
+**DON'T: Rely on position**
+```python
+# ❌ There is no image_index any more, and for good reason
+images = Gimp.get_images()
+image1 = images[0]     # this is NOT stably "your" image
+```
+
+**WHY**: GIMP's image list reorders as images open and close. Create a second canvas
+and the first silently moves from index 0 to index 1. Code holding a position then
+edits the wrong file, with no error at all. A handle is stable for the life of the
+image.
+
+**Prefer the dedicated tools over raw `call_api`.** A tool call resolves `image` for
+you and keeps the image registered. An image created through raw Python-Fu is
+untracked: it has no handle and cannot be closed until you `adopt_image` it or run
+`reseat_displays`.
+
+## ✅ SHARED GIMP - Only Touch What Is Yours
+
+One GIMP can be driven by several agent sessions at once.
+
+**DO: Name your session before anything else**
+```python
+set_session_name("icon export for acme-web")
+```
+
+This is what a human sees if you ever have to ask them for access. "Claude" tells them
+nothing; "icon export for acme-web" lets them decide.
+
+```python
+session_info()                  # what do I own, what will I act on
+list_images(mine_only=True)     # just my images
+close_my_images()               # closes only mine, never theirs
+```
+
+Images marked `mine: false` belong to another session. Trying to name one is **refused**
+outright, not silently retargeted — that is the guard working, not a bug. Images opened
+by hand in GIMP have no owner and are fair game; `adopt_image` claims one.
+
+**Asking for access, when you genuinely need it**
+```python
+request_elevation(reason="clean up 6 stale canvases left by a crashed run")
+...
+revoke_elevation()              # as soon as that task is done
+```
+
+`request_elevation` puts a dialog on the user's screen inside GIMP and blocks until they
+answer. Only call it when you actually need someone else's images, write `reason` for a
+person, and if they say no, work within your own images rather than asking again.
+
+Closing another session's image additionally needs `reason=...` on `close_image`; the
+owner is notified with whatever you write.
+
+**Watch for messages**
+
+Notifications from other sessions ride along on your next tool result under
+`notifications`. If an image of yours has vanished, `get_notifications()` will say who
+closed it and why.
+
+## ✅ CHECKPOINT BEFORE DESTRUCTIVE EDITS
+
+GIMP 3.x gives plug-ins no undo at all — `undo()` and `redo()` always fail and say so.
+The only way back is a checkpoint you took beforehand.
+
+```python
+cp = checkpoint(image=handle, label="before-flatten")["checkpoint"]
+flatten_image(image=handle)
+# wrong call, or the result looks bad:
+restore_checkpoint(cp, image=handle)   # handle still valid afterwards
+```
+
+Take one before anything you cannot reverse: `flatten_image`, `merge_visible_layers`,
+`scale_image` downward, `convert_color_mode`, `crop_*`. It costs one XCF write.
+
+`restore_checkpoint` keeps the **same handle**, so variables holding it stay correct;
+only the underlying `image_id` changes.
+
 ## ✅ FILLING SHAPES - The Right Way
 
 **DO: Use Polygon Selection for Filled Shapes**
@@ -69,6 +159,11 @@ path.to_selection()  # AttributeError!
 ```
 
 **WHY**: PyGObject console maintains a persistent Python environment. Variables, imports, and functions remain in memory between calls.
+
+**CAUTION**: `images[0]` is a position, and positions drift. Bind `image1` once at the
+start of a piece of work and reuse that variable rather than re-reading `images[0]`
+later — by then it may be a different image. Better still, resolve the image with a
+handle-aware tool and keep raw `call_api` for the drawing itself.
 
 ---
 
@@ -187,9 +282,13 @@ Gimp.Drawable.edit_fill(drawable, Gimp.FillType.FOREGROUND)
 ```
 
 **Copy Layer Between Images**
+
+Positions are especially dangerous here — `[0]` and `[1]` can swap between calls.
+Resolve both images by id first (`list_images()` gives you `image_id` per handle):
+
 ```python
-["image1 = Gimp.get_images()[0]",
- "image2 = Gimp.get_images()[1]",
+["image1 = next(i for i in Gimp.get_images() if i.get_id() == SRC_ID)",
+ "image2 = next(i for i in Gimp.get_images() if i.get_id() == DST_ID)",
  "width = image1.get_width()",
  "height = image1.get_height()",
  "image1.select_rectangle(Gimp.ChannelOps.REPLACE, 0, 0, width, height)",
@@ -209,7 +308,9 @@ Gimp.Drawable.edit_fill(drawable, Gimp.FillType.FOREGROUND)
 
 ### Verification After Drawing
 After drawing operations, capture a high-resolution region to verify output quality:
-- Use `get_image_bitmap()` with region parameter to check specific areas
+- Use `get_state_snapshot(image=<handle>, region=...)` — it takes a handle, so it
+  always shows the image you mean. `get_image_bitmap()` has no `image` argument and
+  follows the session's current image instead.
 - Extract only the modified area (saves resources, faster feedback)
 - Can use higher resolution for small regions
 - Example: After drawing a face, get just the face region at high quality
@@ -245,7 +346,7 @@ Check `get_context_state()` before operations that depend on settings:
 
 ## ✅ SELF-CRITIQUE CHECKLIST
 
-After calling `get_image_bitmap()`, systematically check:
+After calling `get_state_snapshot()`, systematically check:
 
 ### Visual Inspection
 - [ ] Do all shapes match their intended form?
@@ -256,6 +357,7 @@ After calling `get_image_bitmap()`, systematically check:
 
 ### Technical Inspection
 - [ ] Are elements on correct layers?
+- [ ] Am I editing the image I think I am? (`image=<handle>`, not a position)
 - [ ] Were all selections cleared after use?
 - [ ] Is Gimp.displays_flush() called after drawing?
 - [ ] Are feather/antialiasing settings appropriate?
@@ -277,7 +379,7 @@ After calling `get_image_bitmap()`, systematically check:
 - STOP drawing new elements
 - Identify which layer has the problem
 - Fix on that specific layer
-- Validate fix with another get_image_bitmap()
+- Validate fix with another get_state_snapshot()
 - Only continue when satisfied
 
 **Never:**
@@ -286,5 +388,11 @@ After calling `get_image_bitmap()`, systematically check:
 - Skip validation "to save time"
 
 ---
+
+### Finishing a task
+- Export or save what you produced
+- Call `close_my_images()` — left-open images clutter the workspace for every other
+  session sharing this GIMP
+- Call `revoke_elevation()` if you were granted administrator access
 
 These patterns are based on practical experience and will help you succeed faster with GIMP MCP operations.

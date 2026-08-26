@@ -49,6 +49,10 @@ ELEVATION_PROMPT_TIMEOUT = 180
 SESSION_STALE_AFTER = 3600
 # Cap the queue so an absent session cannot grow it without bound.
 MAX_NOTIFICATIONS = 50
+# A session that has not spoken for this long is treated as gone, and its
+# images become adoptable. A client restart mints a new session id, so
+# without this an agent is locked out of the images it opened a minute ago.
+SESSION_ORPHAN_AFTER = 300
 
 # Measured against GIMP 3.2.2: the PDB has no *-undo / *-redo procedure and
 # Gimp.Image exposes only undo groups, so these two operations cannot be
@@ -479,16 +483,29 @@ class MCPPlugin(Gimp.PlugIn):
         else:
             response_str = str(response)
             
-        # Send response in chunks for large data
+        # Send response in chunks for large data. A client that gave up waiting
+        # -- a slow approval dialog, say -- leaves a closed socket here, and an
+        # unhandled error would kill this worker and leak the connection. Any
+        # notifications we dequeued for the ride-along go back on the queue,
+        # since nobody received them.
         response_bytes = response_str.encode('utf-8')
         bytes_sent = 0
-        while bytes_sent < len(response_bytes):
-            chunk = response_bytes[bytes_sent:bytes_sent + 8192]
-            client.sendall(chunk)
-            bytes_sent += len(chunk)
-            
-        if self.auto_disconnect_client:
-            client.close()
+        try:
+            while bytes_sent < len(response_bytes):
+                chunk = response_bytes[bytes_sent:bytes_sent + 8192]
+                client.sendall(chunk)
+                bytes_sent += len(chunk)
+        except OSError as exc:
+            print(f"MCP: client went away before the reply was sent ({exc})")
+            if session and isinstance(response, dict):
+                for note in reversed(response.get("notifications") or []):
+                    self._requeue_notification(session, note)
+        finally:
+            if self.auto_disconnect_client:
+                try:
+                    client.close()
+                except OSError:
+                    pass
         return
 
     def execute_command(self, request):
@@ -1850,21 +1867,27 @@ class MCPPlugin(Gimp.PlugIn):
         return f"{base}-{n}"
 
     def _register_image(self, image, display, session, origin, label=None):
-        """Give a new image a handle, record its owner and its display."""
-        identity = {
-            "handle": self._next_handle(label or origin),
-            "session": session,
-            "label": label,
-            "origin": origin,
-            "created": time.time(),
-        }
-        self._write_identity(image, identity)
-        if display is not None:
-            try:
-                self._displays[image.get_id()] = display.get_id()
-            except Exception:
-                pass
-        self._current[session] = image.get_id()
+        """Give a new image a handle, record its owner and its display.
+
+        Minting and claiming happen under the lock: two clients registering at
+        once would otherwise read the same taken-handle set and mint the same
+        handle, leaving two images answering to it forever.
+        """
+        with self._admin_lock:
+            identity = {
+                "handle": self._next_handle(label or origin),
+                "session": session,
+                "label": label,
+                "origin": origin,
+                "created": time.time(),
+            }
+            self._write_identity(image, identity)
+            if display is not None:
+                try:
+                    self._displays[image.get_id()] = display.get_id()
+                except Exception:
+                    pass
+            self._current[session] = image.get_id()
         return identity
 
     def _image_summary(self, image, session=None, index=None):
@@ -1963,6 +1986,38 @@ class MCPPlugin(Gimp.PlugIn):
             f"label and name). Open now: {self._describe_open(session)}"
         )
 
+    def _session_is_stale(self, session):
+        """True when a session has gone quiet long enough to be treated as gone.
+
+        Nothing tells the plugin that a client exited, and a restart mints a new
+        session id, so the images the old one owned would otherwise be
+        unreachable by anyone forever.
+        """
+        if not session or session == ANONYMOUS_SESSION:
+            return True
+        last_seen = self._last_seen.get(session)
+        if last_seen is None:
+            # Never seen in this plugin run: the parasite outlived the process
+            # that wrote it, which is exactly the post-restart case.
+            return True
+        return (time.time() - last_seen) > SESSION_ORPHAN_AFTER
+
+    def _guard_all_images(self, session, what):
+        """Bulk operations reaching past this session need the same permission.
+
+        `all_images` is just a boolean on the wire, so without this any session
+        could opt into rewriting every other session's work in one call --
+        exactly what naming a single image is refused for.
+        """
+        if self._is_elevated(session):
+            return
+        raise RuntimeError(
+            f"{what} with all_images=true touches images belonging to other "
+            f"sessions, which needs administrator access. Ask the user with "
+            f"request_elevation(reason=...), or leave all_images off to act "
+            f"only on your own images."
+        )
+
     def _guard_owner(self, image, session, spec):
         """Refuse to hand over another session's image without elevation.
 
@@ -1972,20 +2027,33 @@ class MCPPlugin(Gimp.PlugIn):
         owner = self._read_identity(image).get("session")
         if owner is None or owner == session or self._is_elevated(session):
             return image
+        if self._session_is_stale(owner):
+            # The owner is gone -- a crashed or restarted client. Its images are
+            # nobody's, and refusing here would strand them permanently.
+            return image
         raise RuntimeError(
-            f"Image '{spec}' belongs to another MCP session ({owner}) and this "
-            f"session is not an administrator. Ask the user for administrator "
-            f"access with request_elevation(reason=...) if you genuinely need "
-            f"to touch other sessions' images."
+            f"Image '{spec}' belongs to another MCP session ({owner}) that is "
+            f"still active, and this session is not an administrator. Ask the "
+            f"user for administrator access with request_elevation(reason=...) "
+            f"if you genuinely need to touch other sessions' images."
         )
 
     def _current_image(self, session, images):
         """The image this session is working on, or a clear error saying why not."""
         by_id = {im.get_id(): im for im in images}
 
+        # A remembered current image is re-checked every time: elevation can be
+        # revoked between calls, and the cursor must not outlive the permission
+        # that set it.
         current = self._current.get(session)
         if current in by_id:
-            return by_id[current]
+            candidate = by_id[current]
+            owner = self._read_identity(candidate).get("session")
+            if (owner is None or owner == session
+                    or self._is_elevated(session)
+                    or self._session_is_stale(owner)):
+                return candidate
+            del self._current[session]
 
         owned = [
             im for im in images
@@ -2003,10 +2071,20 @@ class MCPPlugin(Gimp.PlugIn):
                 f"pass image=<handle>. Yours: {handles}"
             )
 
-        # Nothing of ours is open. Fall back to a lone image only if it is the
-        # only one there -- guessing among several would edit someone else's work.
+        # Nothing of ours is open. A lone image is a reasonable default only
+        # when nobody else owns it -- falling back onto another session's single
+        # open image would edit their work without anyone naming it.
         if len(images) == 1:
-            return images[0]
+            only = images[0]
+            owner = self._read_identity(only).get("session")
+            if (owner is None or self._is_elevated(session)
+                    or self._session_is_stale(owner)):
+                return only
+            raise RuntimeError(
+                f"This session has no image open. The only image in GIMP belongs "
+                f"to another session ({owner}); name it explicitly, and if you "
+                f"genuinely need it ask the user with request_elevation."
+            )
         raise RuntimeError(
             f"This session has no image open, and {len(images)} images belong to "
             f"other sessions; pass image=<handle> explicitly. "
@@ -2040,16 +2118,42 @@ class MCPPlugin(Gimp.PlugIn):
         GIMP cannot map a display back to its image, so an image opened by hand
         in the GIMP window has no recorded display and cannot be closed. This
         recreates one display per image and records it. Every image survives:
-        each gets its new display before any old one is deleted. Window position
-        and zoom are lost, so this only runs on explicit request.
+        each gets its new display before any old one is deleted, and if any
+        image cannot be given one the whole thing is rolled back rather than
+        leaving that image with no window at all. Window position and zoom are
+        lost, so this only runs on explicit request.
         """
         originals = self._valid_display_ids()
         fresh = {}
+        failed = []
         for image in Gimp.get_images():
             try:
-                fresh[image.get_id()] = Gimp.Display.new(image).get_id()
-            except Exception:
-                pass
+                display = Gimp.Display.new(image)
+                if display is None:
+                    raise RuntimeError("Gimp.Display.new returned NULL")
+                fresh[image.get_id()] = display.get_id()
+            except Exception as exc:
+                failed.append((image.get_id(), str(exc)))
+
+        # An image with no fresh display would have its only remaining window
+        # deleted by the loop below, and deleting an image's last display
+        # destroys the image. Undo what we made and refuse instead: losing
+        # someone's unsaved work is far worse than not reseating.
+        if failed:
+            for display_id in fresh.values():
+                try:
+                    if Gimp.Display.id_is_valid(display_id):
+                        Gimp.Display.get_by_id(display_id).delete()
+                except Exception:
+                    pass
+            Gimp.displays_flush()
+            detail = "; ".join(f"image {i}: {e}" for i, e in failed)
+            raise RuntimeError(
+                f"Could not give every open image a new window, so nothing was "
+                f"reseated -- deleting the old windows would have destroyed the "
+                f"images that failed. ({detail})"
+            )
+
         keep = set(fresh.values())
         for display_id in originals:
             if display_id in keep:
@@ -2237,7 +2341,11 @@ class MCPPlugin(Gimp.PlugIn):
                 # would apply the filter to whichever image GIMP listed first.
                 f"_img = [i for i in Gimp.get_images() "
                 f"if i.get_id() == {image.get_id()}][0]",
-                "_d = (_img.get_selected_layers() or _img.get_layers() or [None])[0]",
+                # Address the layer by id too. Falling back to the selected or
+                # topmost layer would silently apply the filter somewhere other
+                # than the layer_name the caller asked for, and still succeed.
+                f"_d = [l for l in _img.get_layers() "
+                f"if l.get_id() == {drawable.get_id()}][0]",
                 f"_d.apply_drawable_filter_new('{op_name}', '', [{props_code}])",
                 "Gimp.displays_flush()",
             ]
@@ -2338,7 +2446,10 @@ class MCPPlugin(Gimp.PlugIn):
             quality      = int(params.get("quality", 90))
             name_pattern = params.get("name_pattern", "{name}")
             image_spec   = params.get("image", None)
-            mine_only    = bool(params.get("mine_only", False))
+            # Defaults to this session's own images, like batch_resize: writing
+            # another session's work out to a caller-chosen directory should be
+            # a deliberate act, not what happens when the argument is omitted.
+            mine_only    = bool(params.get("mine_only", True))
             session      = self._session_id(params)
 
             images = Gimp.get_images()
@@ -2347,13 +2458,14 @@ class MCPPlugin(Gimp.PlugIn):
 
             if image_spec is not None:
                 targets = [(0, self._match_image(image_spec, images, session))]
-            elif mine_only:
+            elif not mine_only:
+                self._guard_all_images(session, "batch_export")
+                targets = [(i, img) for i, img in enumerate(images)]
+            else:
                 targets = [
                     (i, img) for i, img in enumerate(images)
                     if self._read_identity(img).get("session") == session
                 ]
-            else:
-                targets = [(i, img) for i, img in enumerate(images)]
 
             os.makedirs(output_dir, exist_ok=True)
             exported = []
@@ -4178,6 +4290,8 @@ class MCPPlugin(Gimp.PlugIn):
             # belonging to other sessions, and resizing that would be silent damage.
             all_images = bool(params.get("all_images", False))
             session = self._session_id(params)
+            if all_images:
+                self._guard_all_images(session, "batch_resize")
             images = Gimp.get_images()
             if not all_images:
                 images = [
@@ -4239,6 +4353,7 @@ class MCPPlugin(Gimp.PlugIn):
             if source == "images":
                 session = self._session_id(params)
                 if bool(params.get("all_images", False)):
+                    self._guard_all_images(session, "export_sprite_sheet")
                     frames = Gimp.get_images()
                 else:
                     frames = [
@@ -4564,35 +4679,140 @@ class MCPPlugin(Gimp.PlugIn):
             import gi
             gi.require_version("GimpUi", "3.0")
             gi.require_version("Gtk", "3.0")
-            from gi.repository import GimpUi, Gtk
+            from gi.repository import Gdk, GimpUi, Gtk
 
             GimpUi.init("gimp-mcp")
-            dialog = Gtk.MessageDialog(
-                transient_for=None,
-                modal=True,
-                message_type=Gtk.MessageType.WARNING,
-                buttons=Gtk.ButtonsType.NONE,
-                text="Grant administrator access to an MCP session?",
+            esc = GLib.markup_escape_text
+
+            meta = self._session_meta.get(session, {})
+            who = []
+            if meta.get("client"):
+                who.append(esc(str(meta["client"])))
+            if meta.get("cwd"):
+                who.append(f"<tt>{esc(str(meta['cwd']))}</tt>")
+            if not meta.get("client") and not meta.get("cwd"):
+                # A client that sends no name and no working directory has told
+                # you nothing you can judge. Say so rather than showing a gap:
+                # an unidentified caller is a reason for more suspicion, not
+                # less.
+                who.append(
+                    '<b>This session did not identify itself.</b>\n'
+                    "It sent no client name and no working directory, so there "
+                    "is no way to tell which agent is asking. Deny unless you "
+                    "know what it is."
+                )
+            trailer = []
+            if meta.get("host"):
+                trailer.append(esc(str(meta["host"])))
+            if meta.get("pid"):
+                trailer.append(f"pid {esc(str(meta['pid']))}")
+            if meta.get("first_seen"):
+                trailer.append(
+                    "connected "
+                    + time.strftime("%H:%M", time.localtime(meta["first_seen"]))
+                )
+            if trailer:
+                who.append(
+                    '<span size="small" alpha="70%">'
+                    + esc(" \u00b7 ".join(trailer))
+                    + "</span>"
+                )
+            who.append(
+                '<span size="small" alpha="70%">session '
+                + esc(session)
+                + "</span>"
             )
+            who.append(
+                '<span size="small" alpha="70%">already owns: '
+                + esc(self._session_images_summary(session))
+                + "</span>"
+            )
+
             others = [
                 self._read_identity(im).get("handle") or str(im.get_id())
                 for im in Gimp.get_images()
                 if self._read_identity(im).get("session") not in (None, session)
             ]
-            dialog.format_secondary_text(
-                f"Who is asking:\n  {self._describe_session(session)}\n"
-                f"  session id: {session}\n"
-                f"  its own images: {self._session_images_summary(session)}\n\n"
-                f"Reason given:\n  {reason or '(none given)'}\n\n"
-                f"If you grant this, it will also be able to edit and close "
-                f"{len(others)} image(s) belonging to other sessions"
-                + (f": {', '.join(others)}" if others else "")
-                + ".\n\nOnly grant this if you just asked an agent to do it."
+
+            grants = [
+                "Read, edit and close <b>%d image%s</b> belonging to other "
+                "sessions." % (len(others), "" if len(others) == 1 else "s")
+            ]
+            if others:
+                grants.append("<tt>" + esc(", ".join(others)) + "</tt>")
+            else:
+                grants.append(
+                    '<span alpha="70%">No other session has an image open '
+                    "right now, but that can change while the grant "
+                    "lasts.</span>"
+                )
+
+            body = "\n".join([
+                "<b>Who is asking</b>",
+                "\n".join(who),
+                "",
+                "<b>Why</b>",
+                "<i>" + esc(reason or "no reason given") + "</i>",
+                "",
+                "<b>What it would be allowed to do</b>",
+                "\n".join(grants),
+            ])
+
+            dialog = Gtk.MessageDialog(
+                transient_for=None,
+                modal=True,
+                message_type=Gtk.MessageType.OTHER,
+                buttons=Gtk.ButtonsType.NONE,
             )
-            dialog.add_button("Deny", Gtk.ResponseType.REJECT)
-            grant = dialog.add_button("Grant admin access", Gtk.ResponseType.ACCEPT)
+            dialog.set_title("GIMP MCP")
+            dialog.set_markup(
+                "<big><b>Grant administrator access?</b></big>"
+            )
+            dialog.format_secondary_markup(body)
+
+            # MessageDialog labels wrap at whatever width the longest line
+            # happens to force, which makes mixed short/long text ragged.
+            try:
+                for child in dialog.get_message_area().get_children():
+                    if isinstance(child, Gtk.Label):
+                        child.set_line_wrap(True)
+                        child.set_max_width_chars(58)
+                        child.set_xalign(0.0)
+                        child.set_selectable(False)
+            except Exception:
+                pass
+
+            deny = dialog.add_button("Deny", Gtk.ResponseType.REJECT)
+            grant = dialog.add_button("Grant access", Gtk.ResponseType.ACCEPT)
             grant.get_style_context().add_class("destructive-action")
+            grant.get_style_context().add_class("mcp-grant")
+            deny.get_style_context().add_class("suggested-action")
+            deny.get_style_context().add_class("mcp-deny")
+            try:
+                provider = Gtk.CssProvider()
+                provider.load_from_data(b"""
+                .mcp-grant {
+                    background-image: none;
+                    background-color: #c01c28;
+                    color: #ffffff;
+                    font-weight: bold;
+                }
+                .mcp-grant:hover { background-color: #a51d2d; }
+                .mcp-deny {
+                    background-image: none;
+                    font-weight: bold;
+                }
+                """)
+                Gtk.StyleContext.add_provider_for_screen(
+                    Gdk.Screen.get_default(),
+                    provider,
+                    Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+                )
+            except Exception:
+                pass
+
             dialog.set_default_response(Gtk.ResponseType.REJECT)
+            deny.grab_focus()
 
             response = dialog.run()
             dialog.destroy()
@@ -4662,7 +4882,7 @@ class MCPPlugin(Gimp.PlugIn):
                     "granted_at": time.time(),
                     "reason": reason,
                 }
-            Gimp.message(f"MCP: administrator access granted to {session}.")
+            print(f"MCP: administrator access granted to {session}.")
             return {
                 "status": "success",
                 "results": {
@@ -4725,6 +4945,13 @@ class MCPPlugin(Gimp.PlugIn):
             queue.append(payload)
             del queue[:-MAX_NOTIFICATIONS]
         return True
+
+    def _requeue_notification(self, session, payload):
+        """Put a notification back after a failed delivery, oldest first."""
+        with self._admin_lock:
+            queue = self._notifications.setdefault(session, [])
+            queue.insert(0, payload)
+            del queue[MAX_NOTIFICATIONS:]
 
     def _take_notifications(self, session):
         with self._admin_lock:
@@ -4797,28 +5024,51 @@ class MCPPlugin(Gimp.PlugIn):
             handle = identity.get("handle")
             label = identity.get("label")
 
+            old_id = old.get_id()
             restored = Gimp.file_load(
                 Gimp.RunMode.NONINTERACTIVE, Gio.File.new_for_path(path)
             )
             if restored is None:
                 return {"status": "error", "error": f"Could not load {path}"}
             display = Gimp.Display.new(restored)
+            if display is not None:
+                self._displays[restored.get_id()] = display.get_id()
 
-            # Close the stale image, then give the restored one the same handle
-            # so every reference the agent is holding still works.
+            # Close the stale image first. Reusing its handle before it is gone
+            # would leave two images answering to one name, and lookups return
+            # whichever GIMP lists first -- so later edits would land on the
+            # image we meant to discard while reporting success.
+            close_error = None
             try:
                 self._delete_image(old, force=True)
             except Exception as exc:
-                print(f"MCP: could not close the pre-restore image: {exc}")
+                close_error = str(exc)
+            still_open = old_id in [im.get_id() for im in Gimp.get_images()]
+
+            # _delete_image's force path reseats every window, which rewrites
+            # _displays; re-read the restored image's entry rather than trusting
+            # the id captured above.
+            if still_open:
+                new_handle = self._next_handle(label or "restored")
+                note = (
+                    f"The pre-restore image could not be closed"
+                    + (f" ({close_error})" if close_error else "")
+                    + f", so the restored copy was given a new handle "
+                      f"'{new_handle}' rather than duplicating '{handle}'. "
+                      f"Use the new handle; the old image is still open."
+                )
+            else:
+                new_handle = handle or self._next_handle(label or "restored")
+                note = "The handle is unchanged; the image_id is new."
 
             self._write_identity(restored, {
-                "handle": handle or self._next_handle(label or "restored"),
+                "handle": new_handle,
                 "session": session,
                 "label": label,
                 "origin": "restore_checkpoint",
                 "created": time.time(),
             })
-            if display is not None:
+            if self._displays.get(restored.get_id()) is None and display is not None:
                 self._displays[restored.get_id()] = display.get_id()
             self._current[session] = restored.get_id()
             Gimp.displays_flush()
@@ -4827,9 +5077,10 @@ class MCPPlugin(Gimp.PlugIn):
                 "status": "success",
                 "results": {
                     "restored_from": path,
-                    "handle": handle,
+                    "handle": new_handle,
+                    "handle_changed": new_handle != handle,
                     "image_id": restored.get_id(),
-                    "note": "The handle is unchanged; the image_id is new.",
+                    "note": note,
                 },
             }
         except Exception as e:
@@ -4920,11 +5171,43 @@ class MCPPlugin(Gimp.PlugIn):
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 
     def _adopt_image(self, params):
-        """Claim an untracked image (opened by hand in GIMP) for this session."""
+        """Claim an image for this session, giving it a handle.
+
+        Untracked images -- opened by hand in GIMP -- are free to claim. An
+        image belonging to a session that is still active is not: taking it
+        would silently break that session's handle, so it needs the same
+        administrator access and reason as closing one.
+        """
         try:
             session = self._session_id(params)
+            reason = str(params.get("reason", "")).strip()
             image = self._resolve_image(params)
             identity = self._read_identity(image)
+            previous = identity.get("session")
+            if previous is not None and previous != session:
+                if not self._session_is_stale(previous):
+                    if not reason:
+                        return {
+                            "status": "error",
+                            "error": f"Image {identity.get('handle')} belongs to "
+                                     f"session {previous}, which is still active. "
+                                     f"Adopting it breaks that session's handle, "
+                                     f"so it needs reason=..., which is delivered "
+                                     f"to them.",
+                        }
+                    self._notify(previous, {
+                        "type": "image_adopted_by_administrator",
+                        "message": (
+                            f"Your image '{identity.get('handle')}' was taken "
+                            f"over by an administrator; your handle for it no "
+                            f"longer resolves."
+                        ),
+                        "handle": identity.get("handle"),
+                        "image_id": image.get_id(),
+                        "taken_by": session,
+                        "reason": reason,
+                        "at": time.time(),
+                    })
             if identity and identity.get("session") == session:
                 return {
                     "status": "success",

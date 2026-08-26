@@ -4,6 +4,39 @@
 
 **Check your work after every 3-5 operations. Don't continue blindly.**
 
+## Before You Start: Hold A Handle
+
+Open or create the image through a tool, keep the handle it returns, and pass it to
+everything that follows. Positions drift as images open and close; a handle does not.
+
+```python
+set_session_name("portrait retouch")
+handle = open_image("/photos/portrait.png")["handle"]
+# ... all work below passes image=handle, or omits image to use the current one
+get_state_snapshot(image=handle, max_size=1024)
+```
+
+Finish with `close_my_images()`. GIMP may be shared with other sessions, so clean up
+what you opened and leave the rest alone — naming another session's image is refused
+anyway.
+
+## Checkpoint Before You Can't Go Back
+
+There is no undo. GIMP 3.x exposes none to plug-ins, so `undo()` always fails. Before a
+phase you cannot reverse — flatten, merge, scale down, colour-mode change — take a
+snapshot:
+
+```python
+cp = checkpoint(image=handle, label="before-flatten")["checkpoint"]
+flatten_image(image=handle)
+get_state_snapshot(image=handle, max_size=1024)
+# if that validation goes badly:
+restore_checkpoint(cp, image=handle)     # same handle, still valid
+```
+
+This is what makes the "validate, then fix" loop below safe to run on destructive
+steps rather than only on additive ones.
+
 ## Why Iterative Workflow Matters
 
 ### Common Problems Without Validation
@@ -26,10 +59,12 @@
 
 ### Phase 1: Planning (BEFORE drawing anything)
 ```python
+# 0. Know what is open and what is yours
+session_info()
+
 # 1. Understand what you're working with
-metadata = get_image_metadata()
-print(f"Canvas: {metadata['basic']['width']}x{metadata['basic']['height']}")
-print(f"Existing layers: {len(metadata['structure']['layers'])}")
+info = list_layers(image=handle)
+print(f"Existing layers: {info['count']}")
 
 # 2. Plan your layer structure
 # Example for drawing an animal:
@@ -79,7 +114,7 @@ call_api("exec", ["pyGObject-console", [
 ]])
 
 # Step 2: VALIDATE (critical!)
-bitmap = get_image_bitmap(max_width=1024, max_height=1024)
+bitmap = get_state_snapshot(image=handle, max_size=1024)
 # STOP and analyze the bitmap image you just received:
 # 1. Describe what you see in the image
 # 2. Compare to what you intended to draw
@@ -102,7 +137,7 @@ call_api("exec", ["pyGObject-console", [
 ]])
 
 # Step 5: VALIDATE again
-bitmap = get_image_bitmap(max_width=1024, max_height=1024)
+bitmap = get_state_snapshot(image=handle, max_size=1024)
 # STOP and analyze: Does the head look correct? Any issues to fix?
 ```
 
@@ -128,7 +163,7 @@ bitmap = get_image_bitmap(max_width=1024, max_height=1024)
  "Gimp.displays_flush()"]
 
 # Then validate
-get_image_bitmap(max_width=1024, max_height=1024)
+get_state_snapshot(image=handle, max_size=1024)
 ```
 
 ### ❌ Mistake 2: No Validation Until End
@@ -160,7 +195,7 @@ validate()  # ← And here
 
 ## Self-Critique Questions
 
-After each validation with `get_image_bitmap()`, ask yourself:
+After each validation with `get_state_snapshot()`, ask yourself:
 
 ### 1. Layer Issues
 - Are elements on the correct layer?
@@ -178,7 +213,7 @@ After each validation with `get_image_bitmap()`, ask yourself:
 - Instead of checking full image, extract just the modified region
 - Higher resolution possible for small areas
 - Faster feedback, saves resources
-- Example: get_image_bitmap(region={"origin_x": 100, "origin_y": 50, "width": 200, "height": 200})
+- Example: get_state_snapshot(image=handle, region={"x": 100, "y": 50, "width": 200, "height": 200})
 
 ### 3. Selection Cleanup
 - Did I clear selections after drawing?
@@ -300,11 +335,14 @@ After each validation with `get_image_bitmap()`, ask yourself:
 
 The key to success with GIMP MCP:
 
-1. **Plan** layer structure first
-2. **Build** incrementally (3-5 operations at a time)
-3. **Validate** after each build phase with `get_image_bitmap()`
-4. **Fix** issues immediately on correct layer
-5. **Continue** only when current phase is correct
+1. **Name** the session, **open** the image, keep its handle
+2. **Plan** layer structure first
+3. **Checkpoint** before any destructive phase
+4. **Build** incrementally (3-5 operations at a time)
+5. **Validate** after each build phase with `get_state_snapshot(image=handle)`
+6. **Fix** issues on the correct layer, or `restore_checkpoint` if the phase went wrong
+7. **Continue** only when current phase is correct
+8. **Clean up** with `close_my_images()`
 
 **Don't treat GIMP like a single canvas - leverage its professional features!**
 

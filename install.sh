@@ -27,24 +27,31 @@ UNINSTALL=0
 SOURCE_DIR=""
 PORT=9877
 
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --autostart)    AUTOSTART=true ;;
-        --no-autostart) AUTOSTART=false ;;
-        --yes|-y)       ASSUME_YES=1 ;;
-        --uninstall)    UNINSTALL=1 ;;
-        --source)       SOURCE_DIR="${2:-}"; shift ;;
-        --port)         PORT="${2:-9877}"; shift ;;
-        -h|--help)      sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *) echo "Unknown option: $1" >&2; exit 2 ;;
-    esac
-    shift
-done
+die()  { printf '\033[31mError:\033[0m %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    # Reading $0 fails when the script arrives on stdin via curl | bash.
+    cat <<'USAGE'
+GIMP MCP installer
+
+  curl -fsSL https://raw.githubusercontent.com/maorcc/gimp-mcp/main/install.sh | bash
+
+Finds every GIMP 3.x user config directory on this machine, installs the MCP
+plugin into each, and offers to start the MCP server automatically with GIMP.
+
+  --autostart / --no-autostart   set startup behaviour without being asked
+  --yes                          accept defaults, never prompt
+  --uninstall                    remove the plugin from every config dir found
+  --source DIR                   install from a local checkout instead of GitHub
+  --port N                       socket port (default 9877)
+
+  GIMP_MCP_PYTHON=/path/to/python3   force the plug-in interpreter
+USAGE
+}
 
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
-die()  { printf '\033[31mError:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # When run as `curl ... | bash`, stdin is the script itself, so prompts have to
 # read the terminal directly. If there is no terminal, fall back to defaults.
@@ -66,6 +73,30 @@ ask_yes_no() {
         *)                 echo "$default" ;;
     esac
 }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --autostart)    AUTOSTART=true ;;
+        --no-autostart) AUTOSTART=false ;;
+        --yes|-y)       ASSUME_YES=1 ;;
+        --uninstall)    UNINSTALL=1 ;;
+        --source)
+            [ $# -ge 2 ] || die "--source needs a directory"
+            SOURCE_DIR="$2"; shift ;;
+        --port)
+            [ $# -ge 2 ] || die "--port needs a number"
+            PORT="$2"
+            case "$PORT" in
+                ''|*[!0-9]*) die "--port must be a number, got: $PORT" ;;
+            esac
+            [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] \
+                || die "--port must be between 1 and 65535, got: $PORT"
+            shift ;;
+        -h|--help)      usage; exit 0 ;;
+        *) echo "Unknown option: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
 
 # ---------------------------------------------------------------------------
 # Locate GIMP config directories
@@ -128,6 +159,10 @@ if [ "$UNINSTALL" = "1" ]; then
         else
             warn "not installed in $d"
         fi
+        if [ -f "$d/$CONFIG_NAME" ]; then
+            rm -f "$d/$CONFIG_NAME"
+            ok "removed $d/$CONFIG_NAME"
+        fi
     done
     say ""
     say "Done. Restart GIMP to unload the plugin."
@@ -182,9 +217,13 @@ find_python_with_gi() {
     local candidates=() c
     candidates+=("/usr/bin/python3")
     [ -n "${GIMP_MCP_PYTHON:-}" ] && candidates=("$GIMP_MCP_PYTHON" "${candidates[@]}")
-    while IFS= read -r c; do candidates+=("$c"); done < <(
-        command -v -a python3 2>/dev/null
-    )
+    # `type -aP` lists every python3 on PATH. `command -v -a` is not valid
+    # bash -- it exits 2 and prints a usage error -- so the PATH candidates were
+    # silently never probed, which skipped exactly the nix/pyenv/conda setups
+    # this whole block exists for.
+    while IFS= read -r c; do
+        [ -n "$c" ] && candidates+=("$c")
+    done < <(type -aP python3 2>/dev/null || true)
     candidates+=("/usr/local/bin/python3" "/opt/homebrew/bin/python3")
 
     for c in "${candidates[@]}"; do
