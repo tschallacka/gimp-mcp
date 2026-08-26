@@ -814,3 +814,15 @@ To bump the pinned hook versions later:
 ```bash
 uv run pre-commit autoupdate
 ```
+
+## License and copyright
+
+GNU General Public License v3.0 or later. The full text is in [LICENSE](LICENSE),
+kept verbatim as the GPL requires.
+
+    Copyright (C) 2025 Maor <maor80-opensource@yahoo.com>
+    Copyright (C) 2025 Tomer Konforty <tomer.konforty@arkhivist.io>
+    Copyright (C) 2026 tschallacka <tschallacka@outlook.com>
+
+Everyone who has contributed is listed in [AUTHORS](AUTHORS). This project began
+as a fork of https://github.com/maorcc/gimp-mcp and now continues independently.

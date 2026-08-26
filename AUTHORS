@@ -1,0 +1,27 @@
+# Authors and copyright holders
+
+This project is licensed under the GNU General Public License v3.0. The text in
+LICENSE is the license itself and must stay verbatim -- it is not the place for
+copyright notices. Those live here and in the headers of the source files.
+
+## Copyright holders
+
+    Copyright (C) 2025 Maor <maor80-opensource@yahoo.com>
+    Copyright (C) 2025 Tomer Konforty <tomer.konforty@arkhivist.io>
+    Copyright (C) 2026 tschallacka <tschallacka@outlook.com>
+
+## Contributors
+
+Listed by first contribution.
+
+    Maor                <maor80-opensource@yahoo.com>
+    Tomer Konforty      <tomer.konforty@arkhivist.io>
+    Jhon Magdalena      <jhon.magdalena@chitacloud.com>
+    Victor              <esteban1661@gmail.com>
+    Michael Dibbets     <michael@bigbridge.nl>
+    tschallacka         <tschallacka@outlook.com>
+
+## History
+
+Started at https://github.com/maorcc/gimp-mcp. This repository continues from
+that work independently; it is no longer tracking the original.
