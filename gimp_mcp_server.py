@@ -25,6 +25,29 @@ GIMP_PORT = 9877
 # in a shared GIMP.
 SESSION_ID = f"mcp-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
+# A session id is unlabelled by design: nothing in the MCP handshake tells us
+# who the client is. But a user being asked to approve administrator access
+# needs something better than a random string, so the client can name itself.
+# Precedence: set_session_name() at runtime, then $GIMP_MCP_SESSION_NAME, then
+# a generic default.
+DEFAULT_SESSION_NAME = "MCP client"
+SESSION_NAME = os.environ.get("GIMP_MCP_SESSION_NAME") or DEFAULT_SESSION_NAME
+
+
+def session_identity() -> dict:
+    """Who this session is, in terms a person can act on."""
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = None
+    return {
+        "_session": SESSION_ID,
+        "_session_client": SESSION_NAME,
+        "_session_cwd": cwd,
+        "_session_host": socket.gethostname(),
+        "_session_pid": os.getpid(),
+    }
+
 class GimpConnection:
     def __init__(self, host=GIMP_HOST, port=GIMP_PORT):
         self.host = host
@@ -56,7 +79,8 @@ class GimpConnection:
         if not self.sock:
             self.connect()
         params = dict(params) if params else {"args": []}
-        params.setdefault("_session", SESSION_ID)
+        for key, value in session_identity().items():
+            params.setdefault(key, value)
         command = {"type": command_type, "params": params}
         try:
             self.sock.sendall(json.dumps(command).encode('utf-8') + b'\n')
@@ -71,7 +95,17 @@ class GimpConnection:
                     break
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
-            return json.loads(response_data.decode('utf-8'))
+            parsed = json.loads(response_data.decode('utf-8'))
+            # The plugin cannot push to us, so anything queued for this session
+            # arrives attached to whatever response comes next. Hoist it into
+            # the results so the caller actually sees it.
+            notes = parsed.get("notifications")
+            if notes:
+                logger.info("GIMP notifications: %s", notes)
+                results = parsed.get("results")
+                if isinstance(results, dict):
+                    results["notifications"] = notes
+            return parsed
         except Exception as e:
             logger.error(f"Communication error: {e}")
             raise Exception(f"Error communicating with GIMP: {e}")
@@ -2802,6 +2836,202 @@ def reseat_displays(ctx: Context) -> dict:
 
 
 @mcp.tool()
+def request_elevation(ctx: Context, reason: str) -> dict:
+    """Ask the user, in GIMP, to grant this session administrator access.
+
+    By default a session can only touch images it opened itself; naming another
+    session's image is refused. Administrator access lifts that, letting this
+    session edit and close images belonging to every other MCP session sharing
+    this GIMP.
+
+    This puts a dialog on the user's screen in GIMP and blocks until they
+    answer, so only call it when you actually need another session's images,
+    and say plainly why. If they deny it, work within your own images rather
+    than asking again.
+
+    Parameters:
+    - reason: Why you need it. Shown verbatim in the approval dialog, so write
+      it for the user, e.g. "clean up 6 stale canvases left by a crashed run".
+
+    Returns {elevated, already, session, reason} on success.
+    Raises if the user denies it, does not answer, or the dialog cannot open.
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("request_elevation", {"reason": reason})
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        raise Exception(f"request_elevation failed: {e}")
+
+
+@mcp.tool()
+def elevation_status(ctx: Context) -> dict:
+    """Report whether this session currently holds administrator access.
+
+    Returns: {session, elevated, granted_at, reason, admin_sessions}
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("elevation_status", {})
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"elevation_status failed: {e}")
+
+
+@mcp.tool()
+def set_session_name(ctx: Context, name: str) -> dict:
+    """Give this session a name a person will recognise.
+
+    Nothing in the MCP handshake tells the GIMP plugin who is connected, so by
+    default a session shows up as its id plus the working directory. Set a name
+    and it appears wherever the session does: in list_images, in session_info,
+    and -- the reason it matters -- in the dialog asking the user to approve
+    administrator access. A user who cannot tell which agent is asking cannot
+    reasonably approve it.
+
+    Worth calling once at the start of a task. Keep it short and specific:
+    "icon export for acme-web" beats "Claude".
+
+    Parameters:
+    - name: How to describe this session to the user
+
+    Returns: {session, name, cwd, host, pid}
+    """
+    global SESSION_NAME
+    name = (name or "").strip()
+    if not name:
+        raise Exception("name must not be empty")
+    SESSION_NAME = name
+    identity = session_identity()
+    # Push it now so the plugin knows even if nothing else is called.
+    try:
+        get_gimp_connection().send_command("session_info", {})
+    except Exception:
+        pass
+    return {
+        "session": identity["_session"],
+        "name": SESSION_NAME,
+        "cwd": identity["_session_cwd"],
+        "host": identity["_session_host"],
+        "pid": identity["_session_pid"],
+    }
+
+
+@mcp.tool()
+def revoke_elevation(ctx: Context) -> dict:
+    """Give up this session's administrator access.
+
+    Do this as soon as the task that needed it is finished, so a later mistake
+    cannot reach another session's images.
+
+    Returns: {session, was_elevated, elevated}
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("revoke_elevation", {})
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"revoke_elevation failed: {e}")
+
+
+@mcp.tool()
+def get_notifications(ctx: Context) -> dict:
+    """Collect messages left for this session by other sessions or the user.
+
+    The main case is an administrator closing an image of yours: you get a
+    notification naming the image and the reason they gave. Notifications also
+    ride along on other tool results, so you usually see them without asking;
+    call this to check explicitly, for instance if an image you expected has
+    vanished. Collecting them clears the queue.
+
+    Returns: {notifications, count}
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("get_notifications", {})
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"get_notifications failed: {e}")
+
+
+@mcp.tool()
+def checkpoint(
+    ctx: Context,
+    image: str | int | None = None,
+    label: str = "checkpoint",
+    file_path: str | None = None
+) -> dict:
+    """Save a snapshot of an image that restore_checkpoint can roll back to.
+
+    GIMP 3.x exposes no undo to plug-ins at all, so this is how you make a
+    risky edit reversible. Take one before a destructive step (flatten, scale
+    down, colour-mode change) and you can get the earlier state back.
+
+    Parameters:
+    - image: Which image to snapshot (handle, image_id, path, or label).
+      Omit for this session's current image.
+    - label: Short name for the checkpoint, used in the filename
+    - file_path: Where to write the .xcf; defaults to a temp file
+
+    Returns: {checkpoint, handle, image_id, label, bytes}
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("checkpoint", {
+            "image": image, "label": label, "file_path": file_path,
+        })
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"checkpoint failed: {e}")
+
+
+@mcp.tool()
+def restore_checkpoint(
+    ctx: Context,
+    checkpoint: str,
+    image: str | int | None = None
+) -> dict:
+    """Roll an image back to a saved checkpoint.
+
+    The current image is closed and the checkpoint loaded in its place, keeping
+    the same handle, so references you already hold keep working. The image_id
+    changes; the handle does not.
+
+    Parameters:
+    - checkpoint: Path returned by checkpoint()
+    - image: Which image to replace (handle, image_id, path, or label).
+      Omit for this session's current image.
+
+    Returns: {restored_from, handle, image_id, note}
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("restore_checkpoint", {
+            "checkpoint": checkpoint, "image": image,
+        })
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"restore_checkpoint failed: {e}")
+
+
+@mcp.tool()
 def set_active_image(ctx: Context, image: str | int) -> dict:
     """Raise a specific image to the front / make it active in GIMP.
 
@@ -2825,7 +3055,13 @@ def set_active_image(ctx: Context, image: str | int) -> dict:
 
 @mcp.tool()
 def undo(ctx: Context, steps: int = 1, image: str | int | None = None) -> dict:
-    """Undo one or more operations on an image.
+    """Not available: GIMP 3.x exposes no undo to plug-ins.
+
+    The PDB has no gimp-image-undo procedure and Gimp.Image offers only undo
+    *groups*, so this cannot be implemented. Use checkpoint() before a risky
+    edit and restore_checkpoint() to go back, or close the image without
+    saving. Calling this always fails; it is kept so the reason is discoverable
+    rather than looking like a missing feature.
 
     Parameters:
     - steps: Number of undo steps (default 1)
@@ -2848,7 +3084,13 @@ def undo(ctx: Context, steps: int = 1, image: str | int | None = None) -> dict:
 
 @mcp.tool()
 def redo(ctx: Context, steps: int = 1, image: str | int | None = None) -> dict:
-    """Redo one or more previously undone operations on an image.
+    """Not available: GIMP 3.x exposes no redo to plug-ins.
+
+    The PDB has no gimp-image-redo procedure and Gimp.Image offers only undo
+    *groups*, so this cannot be implemented. Use checkpoint() before a risky
+    edit and restore_checkpoint() to go back, or close the image without
+    saving. Calling this always fails; it is kept so the reason is discoverable
+    rather than looking like a missing feature.
 
     Parameters:
     - steps: Number of redo steps (default 1)
@@ -2905,7 +3147,8 @@ def close_image(
     ctx: Context,
     image: str | int | None = None,
     save_first: bool = False,
-    force: bool = False
+    force: bool = False,
+    reason: str | None = None
 ) -> dict:
     """Close an image, optionally saving as XCF first.
 
@@ -2917,13 +3160,18 @@ def close_image(
     - force: Only needed for an image this server did not open. Reseats every
       open image onto a fresh window first so the target can be closed. No
       image is lost, but window position and zoom are reset for all of them.
+    - reason: Required only when closing an image owned by another session,
+      which needs administrator access. The text is delivered to that session
+      as the explanation for the closure, so make it specific.
 
-    Returns: {closed, handle, image_id, method, saved_to, remaining_open}
+    Returns: {closed, handle, image_id, method, saved_to, remaining_open,
+              as_administrator, owner_notified, owner}
     """
     try:
         conn = get_gimp_connection()
         result = conn.send_command("close_image", {
             "image": image, "save_first": save_first, "force": force,
+            "reason": reason,
         })
         if result["status"] == "success":
             return result["results"]

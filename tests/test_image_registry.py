@@ -12,6 +12,7 @@ Run: python3 tests/test_image_registry.py
 import json
 import os
 import sys
+import threading
 import types
 import unittest
 
@@ -216,9 +217,15 @@ MODULE = load_plugin_module()
 
 
 def new_plugin():
+    """A plugin instance with the state __init__ sets, minus the GIMP wiring."""
     plugin = MODULE.MCPPlugin.__new__(MODULE.MCPPlugin)
     plugin._displays = {}
     plugin._current = {}
+    plugin._elevated = {}
+    plugin._notifications = {}
+    plugin._last_seen = {}
+    plugin._session_meta = {}
+    plugin._admin_lock = threading.Lock()
     return plugin
 
 
@@ -483,6 +490,136 @@ class TestAdoption(RegistryTest):
             {"image": identity["handle"], "_session": "s1"}
         )["results"]
         self.assertTrue(result["already_mine"])
+
+
+class TestOwnershipGate(RegistryTest):
+    """Without elevation, another session's images are simply not reachable."""
+
+    def test_naming_another_sessions_handle_is_refused(self):
+        open_canvas(self.plugin, "other", "theirs")
+        with self.assertRaises(RuntimeError) as caught:
+            self.plugin._resolve_image({"image": "theirs", "_session": "mine"})
+        self.assertIn("another MCP session", str(caught.exception))
+        self.assertIn("request_elevation", str(caught.exception))
+
+    def test_naming_by_image_id_is_refused_too(self):
+        image, _ = open_canvas(self.plugin, "other", "theirs")
+        with self.assertRaises(RuntimeError):
+            self.plugin._resolve_image(
+                {"image": image.get_id(), "_session": "mine"}
+            )
+
+    def test_naming_by_path_is_refused_too(self):
+        open_canvas(self.plugin, "other", "theirs", path="/tmp/theirs.png")
+        with self.assertRaises(RuntimeError):
+            self.plugin._resolve_image(
+                {"image": "/tmp/theirs.png", "_session": "mine"}
+            )
+
+    def test_untracked_images_stay_reachable(self):
+        stray = FakeImage(name="by-hand.png", path="/tmp/by-hand.png")
+        FakeGimp.images.append(stray)
+        open_canvas(self.plugin, "other", "theirs")
+        resolved = self.plugin._resolve_image(
+            {"image": "by-hand.png", "_session": "mine"}
+        )
+        self.assertIs(resolved, stray)
+
+    def test_elevation_lifts_the_gate(self):
+        theirs, _ = open_canvas(self.plugin, "other", "theirs")
+        self.plugin._elevated["mine"] = {"granted_at": 0, "reason": "cleanup"}
+        resolved = self.plugin._resolve_image(
+            {"image": "theirs", "_session": "mine"}
+        )
+        self.assertIs(resolved, theirs)
+
+    def test_revoking_restores_the_gate(self):
+        open_canvas(self.plugin, "other", "theirs")
+        self.plugin._elevated["mine"] = {"granted_at": 0, "reason": "cleanup"}
+        self.plugin._revoke_elevation({"_session": "mine"})
+        with self.assertRaises(RuntimeError):
+            self.plugin._resolve_image({"image": "theirs", "_session": "mine"})
+
+    def test_status_reports_elevation(self):
+        info = self.plugin._elevation_status({"_session": "mine"})["results"]
+        self.assertFalse(info["elevated"])
+        self.plugin._elevated["mine"] = {"granted_at": 123, "reason": "why"}
+        info = self.plugin._elevation_status({"_session": "mine"})["results"]
+        self.assertTrue(info["elevated"])
+        self.assertEqual(info["reason"], "why")
+
+    def test_elevation_requires_a_reason(self):
+        result = self.plugin._request_elevation({"_session": "mine", "reason": ""})
+        self.assertEqual(result["status"], "error")
+        self.assertIn("reason is required", result["error"])
+
+
+class TestAdminClose(RegistryTest):
+    def setUp(self):
+        super().setUp()
+        self.plugin._elevated["admin"] = {"granted_at": 0, "reason": "cleanup"}
+        # mark the owner as recently active so notifications are kept
+        self.plugin._last_seen["owner"] = MODULE.time.time()
+
+    def test_closing_another_sessions_image_requires_a_reason(self):
+        open_canvas(self.plugin, "owner", "theirs")
+        result = self.plugin._close_image({"image": "theirs", "_session": "admin"})
+        self.assertEqual(result["status"], "error")
+        self.assertIn("requires reason", result["error"])
+        self.assertEqual(len(FakeGimp.get_images()), 1)
+
+    def test_admin_close_notifies_the_owner(self):
+        open_canvas(self.plugin, "owner", "theirs")
+        result = self.plugin._close_image({
+            "image": "theirs", "_session": "admin",
+            "reason": "stale canvas from a crashed run",
+        })
+        self.assertEqual(result["status"], "success", result)
+        self.assertTrue(result["results"]["as_administrator"])
+        self.assertTrue(result["results"]["owner_notified"])
+        self.assertEqual(FakeGimp.get_images(), [])
+
+        pending = self.plugin._get_notifications({"_session": "owner"})["results"]
+        self.assertEqual(pending["count"], 1)
+        note = pending["notifications"][0]
+        self.assertEqual(note["type"], "image_closed_by_administrator")
+        self.assertEqual(note["handle"], "theirs")
+        self.assertEqual(note["closed_by"], "admin")
+        self.assertEqual(note["reason"], "stale canvas from a crashed run")
+
+    def test_notifications_are_delivered_once(self):
+        open_canvas(self.plugin, "owner", "theirs")
+        self.plugin._close_image({
+            "image": "theirs", "_session": "admin", "reason": "because",
+        })
+        first = self.plugin._get_notifications({"_session": "owner"})["results"]
+        second = self.plugin._get_notifications({"_session": "owner"})["results"]
+        self.assertEqual(first["count"], 1)
+        self.assertEqual(second["count"], 0)
+
+    def test_no_notification_for_a_session_long_gone(self):
+        open_canvas(self.plugin, "ghost", "theirs")
+        self.plugin._last_seen["ghost"] = MODULE.time.time() - 99999
+        result = self.plugin._close_image({
+            "image": "theirs", "_session": "admin", "reason": "cleanup",
+        })
+        self.assertTrue(result["results"]["closed"])
+        self.assertFalse(result["results"]["owner_notified"])
+
+    def test_closing_your_own_image_is_not_an_admin_action(self):
+        open_canvas(self.plugin, "admin", "mine")
+        result = self.plugin._close_image({"image": "mine", "_session": "admin"})
+        self.assertEqual(result["status"], "success", result)
+        self.assertFalse(result["results"]["as_administrator"])
+
+    def test_close_my_images_never_touches_other_sessions(self):
+        """Elevation widens what you can name; it must not widen this."""
+        open_canvas(self.plugin, "owner", "theirs")
+        open_canvas(self.plugin, "admin", "ours")
+        result = self.plugin._close_my_images({"_session": "admin"})["results"]
+        self.assertEqual(result["closed_count"], 1)
+        remaining = [i.get_name() for i in FakeGimp.get_images()]
+        self.assertEqual(remaining, ["theirs"])
 
 
 class TestSessionInfo(RegistryTest):

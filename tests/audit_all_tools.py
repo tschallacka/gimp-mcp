@@ -58,12 +58,24 @@ def send(command_type, params=None, timeout=60) -> dict:
 results = []
 
 
-def check(name, response, note=""):
-    ok = isinstance(response, dict) and response.get("status") == "success"
-    err = ""
-    if not ok:
-        err = (response or {}).get("error", "no response")
-        err = re.sub(r"\s+", " ", str(err))[:150]
+def check(name, response, note="", expect_error=None):
+    """expect_error: substring that must appear in a deliberate failure."""
+    got_error = not (isinstance(response, dict)
+                     and response.get("status") == "success")
+    raw = (response or {}).get("error", "no response") if got_error else ""
+    err = re.sub(r"\s+", " ", str(raw))[:150]
+
+    if expect_error is not None:
+        ok = got_error and expect_error.lower() in str(raw).lower()
+        if ok:
+            err = ""
+            note = note or f"fails as designed: {expect_error}"
+        elif not got_error:
+            err = f"expected it to fail with {expect_error!r}, but it succeeded"
+        else:
+            err = f"failed, but not with {expect_error!r}: {err}"
+    else:
+        ok = not got_error
     results.append((name, ok, err, note))
     mark = "\033[32mok  \033[0m" if ok else "\033[31mFAIL\033[0m"
     line = f"  {mark} {name}"
@@ -132,18 +144,23 @@ def main():
         send("new_canvas", {"width": 100, "height": 100, "name": "audit-decoy"}),
     )
     if second:
-        meta = check(
+        check(
             "handle still resolves after reorder",
             send("get_image_metadata", {"image": handle}),
         )
-        if meta:
-            dims = meta["results"]
-            got = (dims.get("width"), dims.get("height"))
-            check(
-                "resolved the right image",
-                {"status": "success"} if got == (320, 240)
-                else {"status": "error", "error": f"got {got}, wanted (320, 240)"},
+        listed = send("list_images")
+        row = None
+        if listed.get("status") == "success":
+            row = next(
+                (i for i in listed["results"]["images"] if i.get("handle") == handle),
+                None,
             )
+        got = (row or {}).get("width"), (row or {}).get("height")
+        check(
+            "resolved the right image",
+            {"status": "success"} if got == (320, 240)
+            else {"status": "error", "error": f"got {got}, wanted (320, 240)"},
+        )
         check(
             "close_image (decoy)",
             send("close_image", {"image": second["results"]["handle"]}),
@@ -284,15 +301,20 @@ def main():
 
     # ---- history ---------------------------------------------------------
     print("\nhistory")
-    check("undo", send("undo", {**img, "steps": 1}))
-    check("redo", send("redo", {**img, "steps": 1}))
+    # GIMP 3.x exposes no undo/redo to plug-ins at all, so these must fail
+    # with an explanation rather than an AttributeError.
+    check("undo", send("undo", {**img, "steps": 1}),
+          expect_error="does not expose undo")
+    check("redo", send("redo", {**img, "steps": 1}),
+          expect_error="does not expose undo")
 
     # ---- flatten / merge -------------------------------------------------
     print("\nflatten & merge")
     check("merge_visible_layers", send("merge_visible_layers", img))
     check("flatten_image", send("flatten_image", img))
-    check("delete_layer", send("delete_layer", {**img, "layer_name": "painted"}),
-          note="may already be merged away")
+    check("create_layer (to delete)",
+          send("create_layer", {**img, "name": "scratch", "fill": "transparent"}))
+    check("delete_layer", send("delete_layer", {**img, "layer_name": "scratch"}))
 
     # ---- export ----------------------------------------------------------
     print("\nexport")
@@ -311,14 +333,94 @@ def main():
                                {**img, "output_dir": OUT,
                                 "sizes": [{"width": 64, "height": 64}]}))
     check("export_sprite_sheet", send("export_sprite_sheet",
-                                      {**img, "output_dir": OUT,
+                                      {**img,
+                                       "output_path": os.path.join(OUT, "sheet.png"),
                                        "columns": 1, "source": "layers"}))
+    check("empty output_path is refused cleanly",
+          send("export_sprite_sheet", {**img, "output_path": ""}),
+          expect_error="required")
     check("export_social_media_kit", send("export_social_media_kit",
                                           {**img, "output_dir": OUT,
                                            "platforms": ["twitter"]}))
     check("batch_export", send("batch_export",
                                {"output_dir": OUT, "format": "png",
                                 "mine_only": True}))
+
+    # ---- open_image and path lookup --------------------------------------
+    print("\nopen_image & path lookup")
+    png = os.path.join(OUT, "reopen.png")
+    check("export_image (for reopen)",
+          send("export_image", {**img, "file_path": png, "format": "png"}))
+    opened = check("open_image", send("open_image", {"file_path": png}))
+    if opened:
+        oh = opened["results"]["handle"]
+        check("resolve by full path", send("get_image_metadata", {"image": png}))
+        check("resolve by basename",
+              send("get_image_metadata", {"image": os.path.basename(png)}))
+        check("resolve by handle", send("get_image_metadata", {"image": oh}))
+        check("close_image (reopened)", send("close_image", {"image": oh}))
+
+    # ---- checkpoints -------------------------------------------------------
+    print("\ncheckpoints (undo has no API in GIMP 3.x)")
+    cp = check("checkpoint", send("checkpoint", {**img, "label": "before"}))
+    check("undo points at checkpoints", send("undo", img),
+          expect_error="checkpoint")
+    if cp:
+        path = cp["results"]["checkpoint"]
+        check("flatten before restore", send("flatten_image", img))
+        restored = check("restore_checkpoint",
+                         send("restore_checkpoint", {**img, "checkpoint": path}))
+        if restored:
+            check(
+                "handle survives the restore",
+                {"status": "success"}
+                if restored["results"]["handle"] == handle
+                else {"status": "error",
+                      "error": f"handle became {restored['results']['handle']!r}"},
+            )
+
+    # ---- display ownership -------------------------------------------------
+    print("\ndisplay ownership")
+    check("reseat_displays", send("reseat_displays", {}))
+    check("still resolvable after reseat", send("get_image_metadata", img))
+
+    # ---- cross-session isolation ------------------------------------------
+    print("\ncross-session isolation")
+    other = send("new_canvas", {"width": 60, "height": 60, "name": "not-yours",
+                                "_session": "some-other-session"})
+    if other.get("status") == "success":
+        other_handle = other["results"]["handle"]
+        blocked = send("get_image_metadata", {"image": other_handle})
+        check(
+            "another session's image is not reachable",
+            {"status": "success"} if blocked.get("status") == "error"
+            else {"status": "error", "error": "we could read another session's image"},
+        )
+        check(
+            "refusal points at request_elevation",
+            {"status": "success"}
+            if "request_elevation" in str(blocked.get("error", ""))
+            else {"status": "error", "error": f"unhelpful: {blocked.get('error')!r}"},
+        )
+        closed_theirs = send("close_image", {"image": other_handle})
+        check(
+            "closing another session's image is refused",
+            {"status": "success"} if closed_theirs.get("status") == "error"
+            else {"status": "error", "error": "we closed another session's image"},
+        )
+        # clean it up as its owner
+        send("close_my_images", {"_session": "some-other-session"})
+
+    print("\nelevation")
+    check("elevation_status", send("elevation_status", {}))
+    no_reason = send("request_elevation", {"reason": ""})
+    check(
+        "elevation without a reason is refused",
+        {"status": "success"} if no_reason.get("status") == "error"
+        else {"status": "error", "error": "a reasonless request was accepted"},
+    )
+    check("revoke_elevation", send("revoke_elevation", {}))
+    check("get_notifications", send("get_notifications", {}))
 
     # ---- error handling --------------------------------------------------
     print("\nerror handling (these should FAIL cleanly)")

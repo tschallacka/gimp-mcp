@@ -42,6 +42,21 @@ ANONYMOUS_SESSION = "anonymous"
 # and get_by_id(), so display discovery is a bounded scan over candidate ids.
 MAX_DISPLAY_SCAN = 512
 
+# How long the approval dialog waits for the user before giving up.
+ELEVATION_PROMPT_TIMEOUT = 180
+# A session quiet for longer than this is treated as gone, and
+# notifications for it are dropped rather than queued forever.
+SESSION_STALE_AFTER = 3600
+# Cap the queue so an absent session cannot grow it without bound.
+MAX_NOTIFICATIONS = 50
+
+# Measured against GIMP 3.2.2: the PDB has no *-undo / *-redo procedure and
+# Gimp.Image exposes only undo groups, so these two operations cannot be
+# implemented at all. Checkpoints are the working substitute.
+UNDO_UNAVAILABLE = (
+    "GIMP 3.x does not expose undo or redo to plug-ins: the PDB has no gimp-image-undo procedure and Gimp.Image offers only undo *groups*. Use checkpoint() before a risky edit and restore_checkpoint() to go back, or close the image without saving."
+)
+
 # Settings live next to GIMP's own config so they survive a plugin reinstall.
 CONFIG_NAME = "mcp-server.json"
 DEFAULT_CONFIG = {"autostart": False, "port": 9877, "host": "localhost"}
@@ -109,6 +124,21 @@ class MCPPlugin(Gimp.PlugIn):
         self._displays = {}
         # session_id -> image_id most recently acted on by that session
         self._current = {}
+        # session_id -> {"granted_at", "reason"} for sessions the user has
+        # promoted to administrator
+        self._elevated = {}
+        # session_id -> [pending notification dicts], drained on that session's
+        # next request. The wire protocol is request/response, so this is the
+        # only way to reach an agent that is not currently asking anything.
+        self._notifications = {}
+        # session_id -> unix time of its last request, used to decide whether a
+        # session is still around to be told anything
+        self._last_seen = {}
+        # session_id -> {"label", "cwd", "host", "pid", "first_seen"}. The id
+        # alone is a meaningless string; the user approving an elevation needs
+        # to know which agent, in which project, is asking.
+        self._session_meta = {}
+        self._admin_lock = threading.Lock()
 
     def do_set_i18n(self, procname):
         # Plugin has no translations; tell GIMP so it stops logging
@@ -122,6 +152,7 @@ class MCPPlugin(Gimp.PlugIn):
             "plug-in-mcp-check",
             "plug-in-mcp-restart",
             "plug-in-mcp-autostart-toggle",
+            "plug-in-mcp-revoke-admin",
         ]
         # A persistent procedure is launched by GIMP at startup, which is how
         # the server comes up without anyone opening the Tools menu.
@@ -142,6 +173,24 @@ class MCPPlugin(Gimp.PlugIn):
                 name,
             )
             procedure.set_attribution("Viesar Lab", "Viesar Lab", "2026")
+            return procedure
+
+        if name == "plug-in-mcp-revoke-admin":
+            procedure = Gimp.Procedure.new(
+                self, name, Gimp.PDBProcType.PLUGIN, self._run_revoke_admin, None
+            )
+            procedure.set_menu_label(_("Revoke MCP Admin Access"))
+            procedure.set_documentation(
+                _("Withdraw administrator access from every MCP session"),
+                _("Administrator sessions can see and close other sessions' "
+                  "images; this takes that back from all of them"),
+                name,
+            )
+            procedure.set_attribution("Viesar Lab", "Viesar Lab", "2026")
+            procedure.add_enum_argument("run-mode", _("Run mode"), _("The run mode"),
+                                        Gimp.RunMode, Gimp.RunMode.INTERACTIVE,
+                                        GObject.ParamFlags.READWRITE)
+            procedure.add_menu_path('<Image>/Tools/MCP')
             return procedure
 
         if name == "plug-in-mcp-autostart-toggle":
@@ -206,13 +255,31 @@ class MCPPlugin(Gimp.PlugIn):
         cfg = load_config()
         if not cfg.get("autostart"):
             print("MCP: autostart disabled; use Tools > MCP > Start MCP Server.")
+            self._persistent_ready(procedure)
             return procedure.new_return_values(
                 Gimp.PDBStatusType.SUCCESS, GLib.Error()
             )
         self.host = cfg.get("host", self.host)
         self.port = int(cfg.get("port", self.port))
         print(f"MCP: autostarting server on {self.host}:{self.port}")
-        return self.run(procedure, config, run_data)
+        return self._serve(procedure, persistent=True)
+
+    def _run_revoke_admin(self, procedure, config, run_data):
+        """Menu handler: take administrator access back from every session."""
+        with self._admin_lock:
+            revoked = list(self._elevated)
+            self._elevated.clear()
+        if revoked:
+            message = ("MCP: administrator access revoked from "
+                       f"{len(revoked)} session(s).")
+        else:
+            message = "MCP: no session currently has administrator access."
+        print(message)
+        try:
+            Gimp.message(message)
+        except Exception:
+            pass
+        return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, GLib.Error())
 
     def _run_autostart_toggle(self, procedure, config, run_data):
         """Menu handler: flip the autostart flag and say what it is now."""
@@ -296,16 +363,37 @@ class MCPPlugin(Gimp.PlugIn):
 
     def run(self, procedure, config, run_data):
         """Menu handler: start the server."""
+        return self._serve(procedure, persistent=False)
+
+    def _serve(self, procedure, persistent):
+        """Start the socket server and hand the thread to GLib.
+
+        `persistent` marks the GIMP-startup path. A persistent procedure must
+        tell GIMP it has finished initialising, or GIMP blocks the rest of its
+        startup waiting: the GUI's image managers are never built, and every
+        later Gimp.Display.new() fails with a NULL constructor. Acknowledging
+        has to happen after the socket is up but before the main loop, which
+        never returns.
+        """
         if self.running:
             print("MCP Server is already running")
+            if persistent:
+                self._persistent_ready(procedure)
             return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, GLib.Error())
 
-        signal.signal(signal.SIGTERM, self.shutdown_server)
-        signal.signal(signal.SIGINT, self.shutdown_server)
+        try:
+            signal.signal(signal.SIGTERM, self.shutdown_server)
+            signal.signal(signal.SIGINT, self.shutdown_server)
+        except ValueError:
+            # Only settable from the main thread; not fatal if we are not on it.
+            pass
 
         # Server socket runs in a background thread
         server_thread = threading.Thread(target=self._start_server_thread, daemon=True)
         server_thread.start()
+
+        if persistent:
+            self._persistent_ready(procedure)
 
         # GLib main loop runs in the main thread — required for GIMP API calls
         # (all Gimp.* calls go over the wire protocol which needs GLib to dispatch)
@@ -313,6 +401,15 @@ class MCPPlugin(Gimp.PlugIn):
         self._glib_loop.run()
 
         return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, GLib.Error())
+
+    def _persistent_ready(self, procedure):
+        """Release GIMP's startup once the server is listening."""
+        try:
+            procedure.persistent_ready()
+            print("MCP: acknowledged startup; GIMP may finish initialising")
+        except Exception as exc:
+            print(f"MCP: persistent_ready() failed ({exc}); GIMP's GUI may not "
+                  f"finish starting and displays will not be creatable")
 
     def _handle_client(self, client):
         """Handle connected client"""
@@ -353,7 +450,28 @@ class MCPPlugin(Gimp.PlugIn):
             request = str(buffer)
         
         # print(f"Parsed request: {request}")
+        try:
+            session = self._session_id(json.loads(request).get("params", {}))
+        except Exception:
+            session = None
+        if session:
+            now = time.time()
+            self._last_seen[session] = now
+            try:
+                self._record_session_meta(
+                    session, json.loads(request).get("params", {}), now
+                )
+            except Exception:
+                pass
+
         response = self.execute_command(request)
+
+        # The protocol has no server push, so anything queued for this session
+        # rides along on the response to whatever it happened to ask next.
+        if session and isinstance(response, dict):
+            pending = self._take_notifications(session)
+            if pending:
+                response["notifications"] = pending
         print(f"response type: {type(response)}")
         
         if isinstance(response, dict):
@@ -538,6 +656,18 @@ class MCPPlugin(Gimp.PlugIn):
                 return self._convert_color_mode(j.get("params", {}))
             elif "type" in j and j["type"] == "close_image":
                 return self._close_image(j.get("params", {}))
+            elif "type" in j and j["type"] == "request_elevation":
+                return self._request_elevation(j.get("params", {}))
+            elif "type" in j and j["type"] == "elevation_status":
+                return self._elevation_status(j.get("params", {}))
+            elif "type" in j and j["type"] == "revoke_elevation":
+                return self._revoke_elevation(j.get("params", {}))
+            elif "type" in j and j["type"] == "get_notifications":
+                return self._get_notifications(j.get("params", {}))
+            elif "type" in j and j["type"] == "checkpoint":
+                return self._checkpoint(j.get("params", {}))
+            elif "type" in j and j["type"] == "restore_checkpoint":
+                return self._restore_checkpoint(j.get("params", {}))
             elif "type" in j and j["type"] == "session_info":
                 return self._session_info(j.get("params", {}))
             elif "type" in j and j["type"] == "close_my_images":
@@ -1621,12 +1751,67 @@ class MCPPlugin(Gimp.PlugIn):
     # SHARED HELPERS
     # =========================================================================
 
+    def _require_path(self, params, key):
+        """Return a non-empty path parameter, or say which one is missing.
+
+        Handing an empty string to a GIMP file procedure raises a calling error
+        that surfaces as a modal dialog in the user's GIMP window, which the
+        caller never sees. Fail here instead, where the message reaches them.
+        """
+        value = params.get(key)
+        value = str(value).strip() if value is not None else ""
+        if not value:
+            raise RuntimeError(
+                f"'{key}' is required and must not be empty."
+            )
+        return value
+
     # ---- image identity -----------------------------------------------
 
     def _session_id(self, params):
         """Owning session for a request. Clients that send none share one bucket."""
         sid = params.get("_session")
         return str(sid) if sid else ANONYMOUS_SESSION
+
+    def _record_session_meta(self, session, params, now):
+        """Remember who a session says it is, the first time it says it."""
+        meta = self._session_meta.setdefault(session, {"first_seen": now})
+        for key in ("label", "cwd", "host", "pid", "client"):
+            value = params.get("_session_" + key)
+            if value not in (None, ""):
+                meta[key] = value
+
+    def _describe_session(self, session):
+        """A line a human can act on, rather than an opaque session id."""
+        meta = self._session_meta.get(session, {})
+        parts = []
+        if meta.get("client"):
+            parts.append(str(meta["client"]))
+        if meta.get("cwd"):
+            parts.append(f"working in {meta['cwd']}")
+        host_pid = []
+        if meta.get("host"):
+            host_pid.append(str(meta["host"]))
+        if meta.get("pid"):
+            host_pid.append(f"pid {meta['pid']}")
+        if host_pid:
+            parts.append(" ".join(host_pid))
+        if meta.get("first_seen"):
+            parts.append(
+                "first seen "
+                + time.strftime("%H:%M:%S", time.localtime(meta["first_seen"]))
+            )
+        return "; ".join(parts) if parts else "no details reported"
+
+    def _session_images_summary(self, session):
+        owned = [
+            self._read_identity(im).get("handle") or str(im.get_id())
+            for im in Gimp.get_images()
+            if self._read_identity(im).get("session") == session
+        ]
+        if not owned:
+            return "none"
+        return ", ".join(owned)
 
     def _read_identity(self, image):
         """Return the gimp-mcp parasite payload for an image, {} if it has none."""
@@ -1738,7 +1923,7 @@ class MCPPlugin(Gimp.PlugIn):
             wanted = int(spec)
             for image in images:
                 if image.get_id() == wanted:
-                    return image
+                    return self._guard_owner(image, session, spec)
             raise RuntimeError(
                 f"No open image has image_id {wanted}. "
                 f"Open now: {self._describe_open(session)}"
@@ -1753,29 +1938,45 @@ class MCPPlugin(Gimp.PlugIn):
                 im for im in matches
                 if self._read_identity(im).get("session") == session
             ]
-            return (mine or matches)[0]
+            return self._guard_owner((mine or matches)[0], session, spec)
 
         # exact file path, then basename
         for image in images:
             gio_file = image.get_file()
             if gio_file and gio_file.get_path() == spec:
-                return image
+                return self._guard_owner(image, session, spec)
         for image in images:
             gio_file = image.get_file()
             if gio_file and os.path.basename(gio_file.get_path()) == spec:
-                return image
+                return self._guard_owner(image, session, spec)
 
         # label, then GIMP image name
         for image in images:
             if self._read_identity(image).get("label") == spec:
-                return image
+                return self._guard_owner(image, session, spec)
         for image in images:
             if image.get_name() == spec:
-                return image
+                return self._guard_owner(image, session, spec)
 
         raise RuntimeError(
             f"No open image matches '{spec}' (tried handle, image_id, file path, "
             f"label and name). Open now: {self._describe_open(session)}"
+        )
+
+    def _guard_owner(self, image, session, spec):
+        """Refuse to hand over another session's image without elevation.
+
+        An untracked image belongs to nobody and stays available: it is usually
+        one the user opened by hand and wants worked on.
+        """
+        owner = self._read_identity(image).get("session")
+        if owner is None or owner == session or self._is_elevated(session):
+            return image
+        raise RuntimeError(
+            f"Image '{spec}' belongs to another MCP session ({owner}) and this "
+            f"session is not an administrator. Ask the user for administrator "
+            f"access with request_elevation(reason=...) if you genuinely need "
+            f"to touch other sessions' images."
         )
 
     def _current_image(self, session, images):
@@ -2051,7 +2252,7 @@ class MCPPlugin(Gimp.PlugIn):
         """Open an image file, create a display, return metadata."""
         try:
             from gi.repository import Gio
-            file_path = params.get("file_path", "")
+            file_path = self._require_path(params, "file_path")
             gio_file = Gio.File.new_for_path(file_path)
             image = Gimp.file_load(Gimp.RunMode.NONINTERACTIVE, gio_file)
             if image is None:
@@ -2091,7 +2292,7 @@ class MCPPlugin(Gimp.PlugIn):
         """Save image as XCF."""
         try:
             from gi.repository import Gio
-            file_path = params.get("file_path", "")
+            file_path = self._require_path(params, "file_path")
             image = self._resolve_image(params)
             gio_file = Gio.File.new_for_path(file_path)
             pdb = Gimp.get_pdb()
@@ -2110,7 +2311,7 @@ class MCPPlugin(Gimp.PlugIn):
     def _export_image(self, params):
         """Export image to raster format."""
         try:
-            file_path   = params.get("file_path", "")
+            file_path   = self._require_path(params, "file_path")
             fmt         = params.get("format", "png")
             quality     = int(params.get("quality", 90))
             flatten     = bool(params.get("flatten", True))
@@ -2132,7 +2333,7 @@ class MCPPlugin(Gimp.PlugIn):
     def _batch_export(self, params):
         """Export all (or one) open images to output_dir."""
         try:
-            output_dir   = params.get("output_dir", "")
+            output_dir   = self._require_path(params, "output_dir")
             fmt          = params.get("format", "png")
             quality      = int(params.get("quality", 90))
             name_pattern = params.get("name_pattern", "{name}")
@@ -3864,7 +4065,7 @@ class MCPPlugin(Gimp.PlugIn):
     def _export_icon_sizes(self, params):
         """Export icon size sets for Android or iOS."""
         try:
-            output_dir   = params.get("output_dir", "")
+            output_dir   = self._require_path(params, "output_dir")
             platform_str = params.get("platform", "android").lower()
             fmt          = params.get("format", "png")
 
@@ -3924,7 +4125,7 @@ class MCPPlugin(Gimp.PlugIn):
     def _export_web_optimized(self, params):
         """Export as both JPEG and PNG, return comparison."""
         try:
-            output_dir    = params.get("output_dir", "")
+            output_dir    = self._require_path(params, "output_dir")
             jpeg_quality  = int(params.get("jpeg_quality", 85))
             max_width     = params.get("max_width", None)
             max_height    = params.get("max_height", None)
@@ -4029,7 +4230,7 @@ class MCPPlugin(Gimp.PlugIn):
         """Combine frames into a sprite sheet."""
         try:
             from gi.repository import Gegl
-            output_path = params.get("output_path", "")
+            output_path = self._require_path(params, "output_path")
             columns     = params.get("columns", None)
             padding     = int(params.get("padding", 0))
             source      = params.get("source", "layers").lower()
@@ -4061,7 +4262,7 @@ class MCPPlugin(Gimp.PlugIn):
             sheet_w = cols * frame_w + (cols - 1) * padding
             sheet_h = rows * frame_h + (rows - 1) * padding
 
-            sheet = Gimp.Image.new(sheet_w, sheet_h, Gimp.ImageBaseType.RGBA)
+            sheet = Gimp.Image.new(sheet_w, sheet_h, Gimp.ImageBaseType.RGB)
             bg_layer = Gimp.Layer.new(sheet, "Background", sheet_w, sheet_h, Gimp.ImageType.RGBA_IMAGE, 100, Gimp.LayerMode.NORMAL)
             sheet.insert_layer(bg_layer, None, 0)
             Gimp.context_set_background(Gegl.Color.new("transparent"))
@@ -4105,7 +4306,7 @@ class MCPPlugin(Gimp.PlugIn):
     def _export_social_media_kit(self, params):
         """Export for multiple social media platforms."""
         try:
-            output_dir  = params.get("output_dir", "")
+            output_dir  = self._require_path(params, "output_dir")
             platforms   = params.get("platforms", None)
 
             PLATFORM_SIZES = {
@@ -4209,54 +4410,54 @@ class MCPPlugin(Gimp.PlugIn):
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 
     def _undo(self, params):
-        """Undo N steps."""
-        try:
-            steps       = int(params.get("steps", 1))
-            image = self._resolve_image(params)
-            done = 0
-            for _ in range(steps):
-                if image.undo():
-                    done += 1
-                else:
-                    break
-            Gimp.displays_flush()
-            return {"status": "success", "results": {"steps_undone": done}}
-        except Exception as e:
-            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+        """Not available: libgimp 3.x exposes no undo procedure."""
+        return {"status": "error", "error": UNDO_UNAVAILABLE}
 
     def _redo(self, params):
-        """Redo N steps."""
-        try:
-            steps       = int(params.get("steps", 1))
-            image = self._resolve_image(params)
-            done = 0
-            for _ in range(steps):
-                if image.redo():
-                    done += 1
-                else:
-                    break
-            Gimp.displays_flush()
-            return {"status": "success", "results": {"steps_redone": done}}
-        except Exception as e:
-            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+        """Not available: libgimp 3.x exposes no redo procedure."""
+        return {"status": "error", "error": UNDO_UNAVAILABLE}
 
     def _convert_color_mode(self, params):
-        """Convert image color mode."""
+        """Convert an image's colour mode, or report it was already that mode."""
         try:
             mode        = params.get("mode", "RGB").upper()
             num_colors  = int(params.get("num_colors", 256))
             image = self._resolve_image(params)
+
+            # GIMP raises a calling error when asked to convert an image to the
+            # mode it already has, and in a GUI session that surfaces as an
+            # error dialog. Converting to the current mode is a no-op, not a
+            # failure, so say so and skip the call.
+            current = {
+                Gimp.ImageBaseType.RGB:     "RGB",
+                Gimp.ImageBaseType.GRAY:    "GRAY",
+                Gimp.ImageBaseType.INDEXED: "INDEXED",
+            }.get(image.get_base_type())
+            wants_alpha = mode in ("RGBA", "GRAYA")
+            if current == mode.rstrip("A") and not wants_alpha:
+                return {
+                    "status": "success",
+                    "results": {
+                        "status": "success",
+                        "mode": mode,
+                        "changed": False,
+                        "note": f"Image was already {mode}.",
+                    },
+                }
+
             image.undo_group_start()
             try:
                 if mode in ("RGB", "RGBA"):
-                    image.convert_rgb()
+                    if current != "RGB":
+                        image.convert_rgb()
                     if mode == "RGBA":
                         # Add alpha channel to all layers
                         for layer in image.get_layers():
                             if not layer.has_alpha():
                                 layer.add_alpha()
                 elif mode in ("GRAY", "GRAYA"):
-                    image.convert_grayscale()
+                    if current != "GRAY":
+                        image.convert_grayscale()
                     if mode == "GRAYA":
                         for layer in image.get_layers():
                             if not layer.has_alpha():
@@ -4272,7 +4473,10 @@ class MCPPlugin(Gimp.PlugIn):
             finally:
                 image.undo_group_end()
             Gimp.displays_flush()
-            return {"status": "success", "results": {"status": "success", "mode": mode}}
+            return {
+                "status": "success",
+                "results": {"status": "success", "mode": mode, "changed": True},
+            }
         except Exception as e:
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 
@@ -4282,9 +4486,21 @@ class MCPPlugin(Gimp.PlugIn):
             from gi.repository import Gio
             save_first  = bool(params.get("save_first", False))
             force       = bool(params.get("force", False))
+            reason      = str(params.get("reason", "")).strip()
+            session     = self._session_id(params)
             image = self._resolve_image(params)
             identity = self._read_identity(image)
             image_id = image.get_id()
+            owner = identity.get("session")
+            as_admin = owner is not None and owner != session
+            if as_admin and not reason:
+                return {
+                    "status": "error",
+                    "error": f"Image {identity.get('handle') or image_id} belongs "
+                             f"to session {owner}. Closing another session's image "
+                             f"requires reason=..., which is delivered to that "
+                             f"session as the explanation for the closure.",
+                }
             xcf_path = None
             if save_first:
                 img_file = image.get_file()
@@ -4302,6 +4518,24 @@ class MCPPlugin(Gimp.PlugIn):
                     cfg.set_property("file", gio_file)
                     proc.run(cfg)
             method = self._delete_image(image, force=force)
+
+            notified = False
+            if as_admin:
+                notified = self._notify(owner, {
+                    "type": "image_closed_by_administrator",
+                    "message": (
+                        f"Your image '{identity.get('handle') or image_id}' was "
+                        f"closed by an administrator."
+                    ),
+                    "handle": identity.get("handle"),
+                    "image_id": image_id,
+                    "label": identity.get("label"),
+                    "closed_by": session,
+                    "reason": reason,
+                    "saved_to": xcf_path,
+                    "at": time.time(),
+                })
+
             return {
                 "status": "success",
                 "results": {
@@ -4311,6 +4545,291 @@ class MCPPlugin(Gimp.PlugIn):
                     "method": method,
                     "saved_to": xcf_path if save_first else None,
                     "remaining_open": len(Gimp.get_images()),
+                    "as_administrator": as_admin,
+                    "owner_notified": notified,
+                    "owner": owner if as_admin else None,
+                },
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
+    # ---- administrator elevation ----------------------------------------
+
+    def _is_elevated(self, session):
+        return session in self._elevated
+
+    def _ask_user_to_elevate(self, session, reason, result):
+        """Show the approval dialog. Runs on the GLib main thread."""
+        try:
+            import gi
+            gi.require_version("GimpUi", "3.0")
+            gi.require_version("Gtk", "3.0")
+            from gi.repository import GimpUi, Gtk
+
+            GimpUi.init("gimp-mcp")
+            dialog = Gtk.MessageDialog(
+                transient_for=None,
+                modal=True,
+                message_type=Gtk.MessageType.WARNING,
+                buttons=Gtk.ButtonsType.NONE,
+                text="Grant administrator access to an MCP session?",
+            )
+            others = [
+                self._read_identity(im).get("handle") or str(im.get_id())
+                for im in Gimp.get_images()
+                if self._read_identity(im).get("session") not in (None, session)
+            ]
+            dialog.format_secondary_text(
+                f"Who is asking:\n  {self._describe_session(session)}\n"
+                f"  session id: {session}\n"
+                f"  its own images: {self._session_images_summary(session)}\n\n"
+                f"Reason given:\n  {reason or '(none given)'}\n\n"
+                f"If you grant this, it will also be able to edit and close "
+                f"{len(others)} image(s) belonging to other sessions"
+                + (f": {', '.join(others)}" if others else "")
+                + ".\n\nOnly grant this if you just asked an agent to do it."
+            )
+            dialog.add_button("Deny", Gtk.ResponseType.REJECT)
+            grant = dialog.add_button("Grant admin access", Gtk.ResponseType.ACCEPT)
+            grant.get_style_context().add_class("destructive-action")
+            dialog.set_default_response(Gtk.ResponseType.REJECT)
+
+            response = dialog.run()
+            dialog.destroy()
+            while Gtk.events_pending():
+                Gtk.main_iteration()
+            result["granted"] = response == Gtk.ResponseType.ACCEPT
+            result["method"] = "dialog"
+        except Exception as exc:
+            result["granted"] = False
+            result["error"] = str(exc)
+            result["method"] = "unavailable"
+        finally:
+            result["event"].set()
+        return False  # do not repeat this idle callback
+
+    def _request_elevation(self, params):
+        """Ask the user, in GIMP, to promote this session to administrator."""
+        try:
+            session = self._session_id(params)
+            reason = str(params.get("reason", "")).strip()
+
+            if self._is_elevated(session):
+                return {
+                    "status": "success",
+                    "results": {
+                        "elevated": True,
+                        "already": True,
+                        "granted_at": self._elevated[session]["granted_at"],
+                    },
+                }
+
+            if not reason:
+                return {
+                    "status": "error",
+                    "error": "A reason is required: it is shown to the user in "
+                             "the approval dialog so they can judge the request.",
+                }
+
+            result = {"event": threading.Event(), "granted": False}
+            GLib.idle_add(self._ask_user_to_elevate, session, reason, result)
+
+            if not result["event"].wait(ELEVATION_PROMPT_TIMEOUT):
+                return {
+                    "status": "error",
+                    "error": f"No answer within {ELEVATION_PROMPT_TIMEOUT}s. The "
+                             f"approval dialog may be behind the GIMP window. "
+                             f"Ask the user to check GIMP, then try again.",
+                }
+
+            if result.get("method") == "unavailable":
+                return {
+                    "status": "error",
+                    "error": "Could not show the approval dialog in GIMP "
+                             f"({result.get('error')}). Ask the user to grant it "
+                             "from Tools > MCP > Grant Admin Access instead.",
+                }
+
+            if not result["granted"]:
+                return {
+                    "status": "error",
+                    "error": "The user denied administrator access. Work only "
+                             "with this session's own images.",
+                }
+
+            with self._admin_lock:
+                self._elevated[session] = {
+                    "granted_at": time.time(),
+                    "reason": reason,
+                }
+            Gimp.message(f"MCP: administrator access granted to {session}.")
+            return {
+                "status": "success",
+                "results": {
+                    "elevated": True,
+                    "already": False,
+                    "session": session,
+                    "reason": reason,
+                    "note": "This session can now see and close images belonging "
+                            "to other sessions. Closing one notifies its owner.",
+                },
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
+    def _elevation_status(self, params):
+        """Report whether this session holds administrator access."""
+        try:
+            session = self._session_id(params)
+            record = self._elevated.get(session)
+            return {
+                "status": "success",
+                "results": {
+                    "session": session,
+                    "described_as": self._describe_session(session),
+                    "elevated": record is not None,
+                    "granted_at": record["granted_at"] if record else None,
+                    "reason": record["reason"] if record else None,
+                    "admin_sessions": len(self._elevated),
+                },
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
+    def _revoke_elevation(self, params):
+        """Drop this session's administrator access."""
+        try:
+            session = self._session_id(params)
+            with self._admin_lock:
+                had = self._elevated.pop(session, None) is not None
+            return {
+                "status": "success",
+                "results": {"session": session, "was_elevated": had,
+                            "elevated": False},
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
+    # ---- cross-session notifications --------------------------------------
+
+    def _notify(self, session, payload):
+        """Queue a message for another session to collect on its next request."""
+        if not session or session == ANONYMOUS_SESSION:
+            return False
+        last_seen = self._last_seen.get(session)
+        if last_seen is None or (time.time() - last_seen) > SESSION_STALE_AFTER:
+            # Nobody is listening; do not accumulate messages for a dead session.
+            return False
+        with self._admin_lock:
+            queue = self._notifications.setdefault(session, [])
+            queue.append(payload)
+            del queue[:-MAX_NOTIFICATIONS]
+        return True
+
+    def _take_notifications(self, session):
+        with self._admin_lock:
+            return self._notifications.pop(session, [])
+
+    def _get_notifications(self, params):
+        """Collect and clear this session's pending notifications."""
+        try:
+            session = self._session_id(params)
+            pending = self._take_notifications(session)
+            return {
+                "status": "success",
+                "results": {"notifications": pending, "count": len(pending)},
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
+    # ---- checkpoints -------------------------------------------------------
+
+    def _checkpoint(self, params):
+        """Save an XCF snapshot an agent can roll back to.
+
+        libgimp 3.x exposes no undo, so this is how an agent makes a risky edit
+        reversible.
+        """
+        try:
+            from gi.repository import Gio
+            image = self._resolve_image(params)
+            identity = self._read_identity(image)
+            label = params.get("label") or "checkpoint"
+            slug = re.sub(r"[^a-z0-9]+", "-", str(label).lower()).strip("-") or "cp"
+            path = params.get("file_path") or os.path.join(
+                tempfile.gettempdir(),
+                f"gimp-mcp-checkpoint-{image.get_id()}-{slug}-{int(time.time())}.xcf",
+            )
+            proc = Gimp.get_pdb().lookup_procedure("gimp-xcf-save")
+            if proc is None:
+                return {"status": "error", "error": "gimp-xcf-save is unavailable"}
+            cfg = proc.create_config()
+            cfg.set_property("image", image)
+            cfg.set_property("file", Gio.File.new_for_path(path))
+            proc.run(cfg)
+            if not os.path.exists(path):
+                return {"status": "error",
+                        "error": f"checkpoint was not written to {path}"}
+            return {
+                "status": "success",
+                "results": {
+                    "checkpoint": path,
+                    "handle": identity.get("handle"),
+                    "image_id": image.get_id(),
+                    "label": label,
+                    "bytes": os.path.getsize(path),
+                },
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
+    def _restore_checkpoint(self, params):
+        """Reload a checkpoint, keeping the handle the agent already holds."""
+        try:
+            from gi.repository import Gio
+            path = params.get("checkpoint", "")
+            if not path or not os.path.exists(path):
+                return {"status": "error",
+                        "error": f"No checkpoint file at {path!r}"}
+            session = self._session_id(params)
+            old = self._resolve_image(params)
+            identity = self._read_identity(old)
+            handle = identity.get("handle")
+            label = identity.get("label")
+
+            restored = Gimp.file_load(
+                Gimp.RunMode.NONINTERACTIVE, Gio.File.new_for_path(path)
+            )
+            if restored is None:
+                return {"status": "error", "error": f"Could not load {path}"}
+            display = Gimp.Display.new(restored)
+
+            # Close the stale image, then give the restored one the same handle
+            # so every reference the agent is holding still works.
+            try:
+                self._delete_image(old, force=True)
+            except Exception as exc:
+                print(f"MCP: could not close the pre-restore image: {exc}")
+
+            self._write_identity(restored, {
+                "handle": handle or self._next_handle(label or "restored"),
+                "session": session,
+                "label": label,
+                "origin": "restore_checkpoint",
+                "created": time.time(),
+            })
+            if display is not None:
+                self._displays[restored.get_id()] = display.get_id()
+            self._current[session] = restored.get_id()
+            Gimp.displays_flush()
+
+            return {
+                "status": "success",
+                "results": {
+                    "restored_from": path,
+                    "handle": handle,
+                    "image_id": restored.get_id(),
+                    "note": "The handle is unchanged; the image_id is new.",
                 },
             }
         except Exception as e:
@@ -4330,6 +4849,8 @@ class MCPPlugin(Gimp.PlugIn):
                 "status": "success",
                 "results": {
                     "session": session,
+                    "described_as": self._describe_session(session),
+                    "elevated": self._is_elevated(session),
                     "current": current,
                     "my_images": mine,
                     "my_count": len(mine),

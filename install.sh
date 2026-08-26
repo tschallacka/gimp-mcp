@@ -165,6 +165,55 @@ python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$SRC" \
     || die "the plugin file is not valid Python; refusing to install it"
 
 # ---------------------------------------------------------------------------
+# Pin the interpreter.
+#
+# GIMP runs a .py plug-in through its shebang, so `#!/usr/bin/env python3`
+# resolves against whatever PATH GIMP inherited. A python3 without PyGObject
+# earlier on PATH -- common with nix, pyenv, conda or a virtualenv -- makes the
+# plugin die at `import gi` during GIMP's startup scan, and GIMP reports
+# nothing beyond a traceback on stderr that nobody sees. Writing an absolute
+# path to an interpreter that actually has gi removes the dependency on PATH.
+#
+# The Gimp typelib itself is supplied by GIMP at plug-in runtime, so `import
+# gi` succeeding is the whole test; requiring the Gimp namespace here would
+# wrongly reject every valid interpreter.
+# ---------------------------------------------------------------------------
+find_python_with_gi() {
+    local candidates=() c
+    candidates+=("/usr/bin/python3")
+    [ -n "${GIMP_MCP_PYTHON:-}" ] && candidates=("$GIMP_MCP_PYTHON" "${candidates[@]}")
+    while IFS= read -r c; do candidates+=("$c"); done < <(
+        command -v -a python3 2>/dev/null
+    )
+    candidates+=("/usr/local/bin/python3" "/opt/homebrew/bin/python3")
+
+    for c in "${candidates[@]}"; do
+        [ -x "$c" ] || continue
+        if "$c" -c "import gi" >/dev/null 2>&1; then
+            printf '%s\n' "$c"
+            return 0
+        fi
+    done
+    return 1
+}
+
+PYBIN="$(find_python_with_gi || true)"
+if [ -n "$PYBIN" ]; then
+    ok "plug-in interpreter: $PYBIN"
+    tmp_pinned="$TMPDIR_INST/pinned.py"
+    {
+        printf '#!%s\n' "$PYBIN"
+        tail -n +2 "$SRC"
+    } > "$tmp_pinned"
+    mv "$tmp_pinned" "$SRC"
+else
+    warn "no python3 with PyGObject (import gi) found; leaving the shebang as"
+    warn "  #!/usr/bin/env python3. If GIMP does not show Tools > MCP, install"
+    warn "  PyGObject (Debian/Ubuntu: apt install python3-gi) and re-run this."
+    warn "  You can also point the installer at one: GIMP_MCP_PYTHON=/path/to/python3"
+fi
+
+# ---------------------------------------------------------------------------
 # Autostart choice
 # ---------------------------------------------------------------------------
 say ""
